@@ -1,5 +1,5 @@
-import { Bot, InlineKeyboard } from 'grammy';
-import { q, withTx, getSetting, setSetting } from './db.js';
+import { Bot, InlineKeyboard, Keyboard } from 'grammy';
+import { q, withTx, getSetting, setSetting, setState, getState, clearState } from './db.js';
 import { parseTask } from './parser.js';
 import {
   regenerateReminders,
@@ -9,6 +9,7 @@ import {
 } from './reminders.js';
 import { DateTime, TZ, fmt, humanOffset } from './time.js';
 import { syncAllCalendars } from './calendar/ics.js';
+import { addItems, toggleItem, clearChecked, renderList, refreshMessage } from './shopping.js';
 import {
   parseRecurrence,
   looksRecurring,
@@ -19,6 +20,18 @@ import {
 } from './recurrence.js';
 
 export const bot = new Bot(process.env.TELEGRAM_BOT_TOKEN);
+
+// Постоянная клавиатура под полем ввода. Только в личке: в группе она
+// была бы общей на всех и мешала бы обычной переписке.
+const mainKeyboard = new Keyboard()
+  .text('🛒 Покупки')
+  .text('📋 Сегодня')
+  .row()
+  .text('📆 Неделя')
+  .text('🔁 Повторы')
+  .resized();
+
+const exitKeyboard = new Keyboard().text('✅ Выйти').resized();
 
 const esc = (s) =>
   String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -66,8 +79,10 @@ function taskKeyboard(id, recurrenceId = null) {
     .text('⏰ +1 час', `snooze:${id}:60`)
     .row()
     .text('📅 Завтра', `tomorrow:${id}`)
-    .text('🗑 Удалить', `drop:${id}`);
-  if (recurrenceId) kb.row().text('🚫 Отключить повтор', `drop_recur:${recurrenceId}`);
+    .text('🗑 Удалить', `drop:${id}`)
+    .row()
+    .text('✏️ Изменить', `edit:${id}`);
+  if (recurrenceId) kb.text('🚫 Отключить повтор', `drop_recur:${recurrenceId}`);
   return kb;
 }
 
@@ -97,8 +112,8 @@ bot.command('start', async (ctx) => {
     `Привет, ${esc(user.name)}! Я домашний ассистент.\n\n` +
       `Просто пиши задачу текстом:\n` +
       `<code>завтра в 18:30 забрать посылку, напомни за сутки и за 2 часа</code>\n\n` +
-      `Команды: /today /week /list /cal /sync /help`,
-    { parse_mode: 'HTML' }
+      `Кнопки внизу — покупки и списки задач. Команды: /help`,
+    { parse_mode: 'HTML', reply_markup: mainKeyboard }
   );
 });
 
@@ -110,9 +125,12 @@ bot.command('help', (ctx) =>
       `<b>Повторяющиеся</b>\n«каждый вторник в 20:00», «по будням», «по выходным», ` +
       `«каждое 29 число», «каждый предпоследний день месяца», «каждый первый понедельник месяца», ` +
       `«каждые 2 недели», «ежедневно».\n\n` +
+      `<b>Ещё</b>\nОтветьте на чужое сообщение словом «+завтра в 18:00» — задача создастся из того сообщения.\n` +
+      `В личке внизу есть кнопки: покупки, сегодня, неделя, повторы.\n\n` +
       `<b>Команды</b>\n` +
       `/today — что сегодня\n/week — на неделю\n/list — все открытые\n` +
-      `/done ID — закрыть\n/del ID — удалить\n/recur — повторяющиеся задачи\n` +
+      `/done ID — закрыть\n/del ID — удалить\n/edit ID текст — изменить\n` +
+      `/buy — список покупок\n/recur — повторяющиеся задачи\n` +
       `/cal add URL — подключить календарь (ссылка .ics)\n` +
       `/cal list, /cal del ID\n/sync — синхронизировать календари сейчас\n` +
       `/tz — текущая таймзона`,
@@ -134,15 +152,18 @@ async function listTasks(ctx, { from, to, title }) {
   await ctx.reply(`<b>${title}</b>\n\n` + rows.map(taskLine).join('\n\n'), { parse_mode: 'HTML' });
 }
 
-bot.command('today', (ctx) => {
+const showToday = (ctx) => {
   const now = DateTime.now().setZone(TZ);
   return listTasks(ctx, { from: now.startOf('day'), to: now.endOf('day'), title: 'Сегодня' });
-});
+};
 
-bot.command('week', (ctx) => {
+const showWeek = (ctx) => {
   const now = DateTime.now().setZone(TZ);
   return listTasks(ctx, { from: now.startOf('day'), to: now.plus({ days: 7 }), title: 'Ближайшая неделя' });
-});
+};
+
+bot.command('today', showToday);
+bot.command('week', showWeek);
 
 bot.command('list', (ctx) => {
   const now = DateTime.now().setZone(TZ);
@@ -335,20 +356,7 @@ async function createRecurrenceFromText(ctx, original, found) {
   return rec;
 }
 
-bot.command('recur', async (ctx) => {
-  const args = (ctx.match || '').trim().split(/\s+/).filter(Boolean);
-  if (args[0] === 'del') {
-    const id = Number(String(args[1] || '').replace(/[#R]/gi, ''));
-    if (!id) return ctx.reply('Формат: /recur del 3');
-    const res = await deactivateRecurrence(id);
-    return ctx.reply(
-      res
-        ? `Правило «${esc(res.recurrence.title)}» отключено, снято будущих задач: ${res.cancelled}`
-        : 'Не нашёл такое правило',
-      { parse_mode: 'HTML' }
-    );
-  }
-
+async function showRecurrences(ctx) {
   const { rows } = await q(
     `select r.*, u.name as assignee_name
        from recurrences r left join users u on u.id = r.assignee_id
@@ -377,6 +385,115 @@ bot.command('recur', async (ctx) => {
       '\n\nУдалить: <code>/recur del 3</code>',
     { parse_mode: 'HTML' }
   );
+}
+
+bot.command('recur', async (ctx) => {
+  const args = (ctx.match || '').trim().split(/\s+/).filter(Boolean);
+  if (args[0] === 'del') {
+    const id = Number(String(args[1] || '').replace(/[#R]/gi, ''));
+    if (!id) return ctx.reply('Формат: /recur del 3');
+    const res = await deactivateRecurrence(id);
+    return ctx.reply(
+      res
+        ? `Правило «${esc(res.recurrence.title)}» отключено, снято будущих задач: ${res.cancelled}`
+        : 'Не нашёл такое правило',
+      { parse_mode: 'HTML' }
+    );
+  }
+
+  return showRecurrences(ctx);
+});
+
+// --- список покупок ---------------------------------------------------------
+
+async function showShoppingList(ctx) {
+  const { text, keyboard } = await renderList();
+  return ctx.reply(text, { parse_mode: 'HTML', reply_markup: keyboard });
+}
+
+bot.command('buy', async (ctx) => {
+  const text = (ctx.match || '').trim();
+  const user = await upsertUser(ctx.from, ctx.chat);
+  if (!text) return showShoppingList(ctx);
+  const added = await addItems(text, user.id);
+  await ctx.reply(
+    added.length ? `🛒 Добавлено: ${esc(added.join(', '))}` : 'Это уже есть в списке',
+    { parse_mode: 'HTML' }
+  );
+  return showShoppingList(ctx);
+});
+
+bot.callbackQuery(/^buy_tog:(\d+)$/, async (ctx) => {
+  const user = await upsertUser(ctx.from, ctx.chat);
+  const item = await toggleItem(Number(ctx.match[1]), user.id);
+  await ctx.answerCallbackQuery(item ? (item.checked ? '✅ В корзине' : 'Вернул в список') : 'Нет такого');
+  await refreshMessage(ctx);
+});
+
+bot.callbackQuery('buy_clear', async (ctx) => {
+  const n = await clearChecked();
+  await ctx.answerCallbackQuery(`Убрано: ${n}`);
+  await refreshMessage(ctx);
+});
+
+bot.callbackQuery('buy_add', async (ctx) => {
+  const user = await upsertUser(ctx.from, ctx.chat);
+  await setState(user.id, 'shopping');
+  await ctx.answerCallbackQuery();
+  await ctx.reply(
+    'Пишите товары — можно списком через запятую или с новой строки.\nКогда закончите, нажмите «Выйти».',
+    { reply_markup: ctx.chat.type === 'private' ? exitKeyboard : undefined }
+  );
+});
+
+// --- редактирование ---------------------------------------------------------
+
+async function applyEdit(ctx, id, text) {
+  const parsed = await parseTask(text);
+  const assignee = parsed.assigneeUsername ? await findUserByUsername(parsed.assigneeUsername) : null;
+
+  const task = await withTx(async (c) => {
+    const { rows } = await c.query(
+      `update tasks set title=$2, due_at=$3, is_all_day=$4, updated_at=now(),
+                        assignee_id = coalesce($5::int, assignee_id),
+                        offsets = case when $6::jsonb is null then offsets else $6::jsonb end
+        where id=$1 and status='pending' returning *`,
+      [
+        id,
+        parsed.title,
+        parsed.dueAt,
+        parsed.isAllDay,
+        assignee?.id || null,
+        parsed.offsets.length ? JSON.stringify(parsed.offsets) : null,
+      ]
+    );
+    if (!rows.length) return null;
+    await regenerateReminders(rows[0], c);
+    return rows[0];
+  });
+
+  if (!task) return ctx.reply('Не нашёл такую открытую задачу');
+  return ctx.reply(
+    `✏️ <b>${esc(task.title)}</b>\n🗓 ${fmt(new Date(task.due_at), TZ, task.is_all_day)}\n<code>#${task.id}</code>`,
+    { parse_mode: 'HTML', reply_markup: taskKeyboard(task.id, task.recurrence_id) }
+  );
+}
+
+bot.command('edit', async (ctx) => {
+  const raw = (ctx.match || '').trim();
+  const m = /^#?(\d+)\s+(.+)$/s.exec(raw);
+  if (!m) return ctx.reply('Формат: /edit 42 завтра в 19:00 новый текст');
+  return applyEdit(ctx, Number(m[1]), m[2]);
+});
+
+bot.callbackQuery(/^edit:(\d+)$/, async (ctx) => {
+  const user = await upsertUser(ctx.from, ctx.chat);
+  await setState(user.id, 'edit', Number(ctx.match[1]));
+  await ctx.answerCallbackQuery();
+  await ctx.reply(
+    `Пришлите новый текст задачи <code>#${ctx.match[1]}</code> — с датой и временем, как при создании.`,
+    { parse_mode: 'HTML' }
+  );
 });
 
 bot.command('task', (ctx) => {
@@ -389,10 +506,52 @@ bot.on('message:text', async (ctx) => {
   const text = ctx.message.text.trim();
   if (text.startsWith('/')) return;
 
-  if (ctx.chat.type === 'private') return createTaskFromText(ctx, text);
+  const isPrivate = ctx.chat.type === 'private';
+  const replied = ctx.message.reply_to_message;
 
-  // В группе не перехватываем всю болтовню — только явные «+задача»
-  if (text.startsWith('+')) return createTaskFromText(ctx, text.slice(1).trim());
+  // В группе не перехватываем всю болтовню — только явные «+задача».
+  // Ранний выход заодно экономит запрос в БД на каждое сообщение чата.
+  if (!isPrivate && !text.startsWith('+')) return;
+
+  const user = await upsertUser(ctx.from, ctx.chat);
+
+  // 1. Кнопки нижней клавиатуры
+  if (isPrivate) {
+    if (text === '🛒 Покупки') return showShoppingList(ctx);
+    if (text === '📋 Сегодня') return showToday(ctx);
+    if (text === '📆 Неделя') return showWeek(ctx);
+    if (text === '🔁 Повторы') return showRecurrences(ctx);
+    if (text === '✅ Выйти') {
+      await clearState(user.id);
+      return ctx.reply('Готово.', { reply_markup: mainKeyboard });
+    }
+  }
+
+  // 2. Активный режим ввода — сообщение уходит не в задачи
+  const state = await getState(user.id);
+  if (state?.mode === 'shopping') {
+    const added = await addItems(text, user.id);
+    await ctx.reply(
+      added.length ? `🛒 ${esc(added.join(', '))}` : 'Это уже в списке',
+      { parse_mode: 'HTML' }
+    );
+    return;
+  }
+  if (state?.mode === 'edit') {
+    await clearState(user.id);
+    return applyEdit(ctx, state.target_id, text);
+  }
+
+  // 3. Ответ на чужое сообщение: текст оттуда становится задачей,
+  //    а написанное сейчас — уточнением времени
+  let payload = isPrivate ? text : text.slice(1).trim();
+  if (replied && !replied.from?.is_bot) {
+    const source = (replied.text || replied.caption || '').trim();
+    if (source) payload = `${payload} ${source}`.trim();
+  }
+
+  if (!payload) return;
+  return createTaskFromText(ctx, payload);
 });
 
 // --- инлайн-кнопки ----------------------------------------------------------

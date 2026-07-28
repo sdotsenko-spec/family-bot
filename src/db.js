@@ -85,3 +85,29 @@ export async function setSetting(key, value) {
     [key, JSON.stringify(value)]
   );
 }
+
+// --- короткоживущий режим ввода --------------------------------------------
+
+const STATE_TTL_MIN = Number(process.env.STATE_TTL_MIN || 10);
+
+export async function setState(userId, mode, targetId = null) {
+  await q(
+    `insert into user_state (user_id, mode, target_id, expires_at)
+     values ($1,$2,$3, now() + ($4 || ' minutes')::interval)
+     on conflict (user_id) do update set
+       mode = excluded.mode, target_id = excluded.target_id, expires_at = excluded.expires_at`,
+    [userId, mode, targetId, String(STATE_TTL_MIN)]
+  );
+}
+
+export async function getState(userId) {
+  const { rows } = await q(
+    `select * from user_state where user_id = $1 and expires_at > now()`,
+    [userId]
+  );
+  return rows[0] || null;
+}
+
+export async function clearState(userId) {
+  await q('delete from user_state where user_id = $1', [userId]);
+}
