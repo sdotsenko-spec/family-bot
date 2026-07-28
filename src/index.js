@@ -4,6 +4,7 @@ import { migrate, pool } from './db.js';
 import { bot, maybeSendDigest } from './bot.js';
 import { dispatchDueReminders } from './reminders.js';
 import { syncAllCalendars } from './calendar/ics.js';
+import { materializeAll } from './recurrence.js';
 
 const REMINDER_TICK_MS = 60_000;
 const CAL_TICK_MS = Number(process.env.CAL_SYNC_MIN || 15) * 60_000;
@@ -39,11 +40,13 @@ async function main() {
   });
 
   heartbeat('calendars', CAL_TICK_MS, syncAllCalendars);
+  heartbeat('recurrences', 3_600_000, materializeAll); // раз в час достраиваем горизонт
   heartbeat('digest', 60_000, maybeSendDigest);
 
   // Первый проход сразу после старта — добираем всё, что созрело за время деплоя
   setTimeout(tickReminders, 3_000);
   setTimeout(() => syncAllCalendars().catch(() => {}), 10_000);
+  setTimeout(() => materializeAll().catch(() => {}), 15_000);
 
   // Railway любит открытый порт
   const port = process.env.PORT || 3000;

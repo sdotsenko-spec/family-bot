@@ -20,6 +20,12 @@ const cases = [
 
 let failures = 0;
 
+const check2 = (name, got, want) => {
+  const ok = JSON.stringify(got) === JSON.stringify(want);
+  if (!ok) { failures++; console.log(`✗ ${name}\n    получили ${JSON.stringify(got)}\n    ждали   ${JSON.stringify(want)}`); }
+  else console.log(`✓ ${name}`);
+};
+
 for (const text of cases) {
   const r = parseFallback(text, TZ, NOW);
   const due = DateTime.fromJSDate(r.dueAt).setZone(TZ);
@@ -98,6 +104,58 @@ for (const [label, expected] of [
   check('пинг содержит упоминание', pinged[1].text.includes('@serhii'), true);
   check('пинг НЕ раскрывает название задачи', pinged[1].text.includes('Забрать посылку'), false);
   check('пинг НЕ раскрывает время', /\d{1,2}:\d{2}/.test(pinged[1].text), false);
+}
+
+// --- повторяющиеся задачи ---------------------------------------------------
+{
+  const { parseRecurrence, describeRrule, occurrencesBetween, looksRecurring } =
+    await import('./recurrence.js');
+
+  const fmtOcc = (list) =>
+    list.map((d) => DateTime.fromJSDate(d).setZone(TZ).toFormat('dd.MM HH:mm'));
+
+  const rules = [
+    ['каждый вторник в 20:00 вынести мусор', 'FREQ=WEEKLY;BYDAY=TU', 'вынести мусор'],
+    ['по будням в 7:30 разбудить детей', 'FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR', 'разбудить детей'],
+    ['каждое 29 число оплатить кредит', 'FREQ=MONTHLY;BYMONTHDAY=29', 'оплатить кредит'],
+    ['каждый предпоследний день месяца сдать отчёт', 'FREQ=MONTHLY;BYMONTHDAY=-2', 'сдать отчёт'],
+    ['каждый первый понедельник месяца планёрка', 'FREQ=MONTHLY;BYDAY=1MO', 'планёрка'],
+    ['каждые 2 недели полить цветы', 'FREQ=WEEKLY;INTERVAL=2', 'полить цветы'],
+    ['каждый вторник и пятницу тренировка', 'FREQ=WEEKLY;BYDAY=TU,FR', 'тренировка'],
+    ['ежедневно в 22:00 таблетки', 'FREQ=DAILY', 'таблетки'],
+  ];
+
+  for (const [text, wantRule, wantTitleFragment] of rules) {
+    const r = parseRecurrence(text);
+    const ok = r && r.rrule === wantRule && r.rest.includes(wantTitleFragment);
+    if (!ok) { failures++; console.log(`✗ ${text}\n    → ${r ? r.rrule + ' | «' + r.rest + '»' : 'не распознано'}`); }
+    else console.log(`✓ ${describeRrule(r.rrule).padEnd(32)} ← ${text}`);
+  }
+
+  const noRule = parseRecurrence('завтра в 18:00 забрать посылку');
+  check2('разовая задача не считается повторяющейся', noRule, null);
+  check2('намёк на повтор ловится', looksRecurring('каждый третий четверг что-то'), true);
+
+  // Короткий месяц: 29 числа в феврале 2027 (28 дней) — должно упасть на 28-е
+  const feb = fmtOcc(
+    occurrencesBetween(
+      { tz: TZ, month_end_fallback: true, rrule: 'FREQ=MONTHLY;BYMONTHDAY=29',
+        dtstart: new Date('2026-12-29T20:00:00+02:00') },
+      new Date('2027-02-01'), new Date('2027-03-05')
+    )
+  );
+  check2('февраль без 29-го → последний день месяца', feb, ['28.02 20:00']);
+
+  // Переход на летнее время: стенное время не должно уехать
+  const dst = fmtOcc(
+    occurrencesBetween(
+      { tz: TZ, month_end_fallback: true, rrule: 'FREQ=WEEKLY;BYDAY=TU',
+        dtstart: new Date('2027-03-16T20:00:00+02:00') },
+      new Date('2027-03-16'), new Date('2027-04-07')
+    )
+  );
+  check2('время суток переживает переход на летнее время',
+    dst, ['16.03 20:00', '23.03 20:00', '30.03 20:00', '06.04 20:00']);
 }
 
 console.log(failures ? `\n${failures} провалов` : '\nВсё зелёное');

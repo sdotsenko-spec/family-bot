@@ -9,6 +9,14 @@ import {
 } from './reminders.js';
 import { DateTime, TZ, fmt, humanOffset } from './time.js';
 import { syncAllCalendars } from './calendar/ics.js';
+import {
+  parseRecurrence,
+  looksRecurring,
+  describeRrule,
+  materializeRecurrence,
+  deactivateRecurrence,
+  occurrencesBetween,
+} from './recurrence.js';
 
 export const bot = new Bot(process.env.TELEGRAM_BOT_TOKEN);
 
@@ -46,7 +54,8 @@ async function findUserByUsername(username) {
 // --- рендер -----------------------------------------------------------------
 
 function taskLine(t) {
-  const mark = t.status === 'done' ? '✅' : t.source !== 'bot' ? '🗓' : '•';
+  const mark =
+    t.status === 'done' ? '✅' : t.source === 'recur' ? '🔁' : t.source !== 'bot' ? '🗓' : '•';
   const who = t.assignee_name ? ` — ${esc(t.assignee_name)}` : '';
   return `${mark} <b>${esc(t.title)}</b>${who}\n   ${fmt(new Date(t.due_at), t.tz || TZ, t.is_all_day)}  <code>#${t.id}</code>`;
 }
@@ -91,9 +100,13 @@ bot.command('help', (ctx) =>
     `<b>Создать задачу</b>\nВ личке — просто текстом. В группе — сообщение с <b>+</b> в начале.\n` +
       `Понимаю: сегодня/завтра/послезавтра, «в среду», «5 августа», «12.08», «через 2 часа», ` +
       `«в 18:30», «вечером», «@username», «напомни за сутки и за 2 часа».\n\n` +
+      `<b>Повторяющиеся</b>\n«каждый вторник в 20:00», «по будням», «по выходным», ` +
+      `«каждое 29 число», «каждый предпоследний день месяца», «каждый первый понедельник месяца», ` +
+      `«каждые 2 недели», «ежедневно».\n\n` +
       `<b>Команды</b>\n` +
       `/today — что сегодня\n/week — на неделю\n/list — все открытые\n` +
-      `/done ID — закрыть\n/cal add URL — подключить календарь (ссылка .ics)\n` +
+      `/done ID — закрыть\n/recur — повторяющиеся задачи\n` +
+      `/cal add URL — подключить календарь (ссылка .ics)\n` +
       `/cal list, /cal del ID\n/sync — синхронизировать календари сейчас\n` +
       `/tz — текущая таймзона`,
     { parse_mode: 'HTML' }
@@ -192,6 +205,11 @@ bot.command('cal', async (ctx) => {
 // --- создание задачи --------------------------------------------------------
 
 async function createTaskFromText(ctx, text) {
+  // Сначала проверяем, не описано ли повторение — иначе «каждый вторник»
+  // молча превратилось бы в разовую задачу на ближайший вторник
+  const found = parseRecurrence(text);
+  if (found) return createRecurrenceFromText(ctx, text, found);
+
   const creator = await upsertUser(ctx.from, ctx.chat);
   const parsed = await parseTask(text);
   const assignee = parsed.assigneeUsername ? await findUserByUsername(parsed.assigneeUsername) : null;
@@ -228,16 +246,115 @@ async function createTaskFromText(ctx, text) {
     ? rems.map((r) => humanOffset(r.label)).filter((l) => l !== 'просрочено').join(', ')
     : 'нет (срок слишком близко)';
 
+  const warn = looksRecurring(text)
+    ? '\n\n⚠️ Похоже на повторяющуюся задачу, но правило распознать не вышло — ' +
+      'поставил разовую. Попробуйте формулировку вида «каждый вторник в 20:00 …».'
+    : '';
+
   await ctx.reply(
     `📌 <b>${esc(task.title)}</b>\n` +
       `🗓 ${fmt(new Date(task.due_at), TZ, task.is_all_day)}\n` +
       (assignee ? `👤 ${esc(assignee.name)}\n` : '') +
       `🔔 напомню: ${planned}\n` +
-      `<code>#${task.id}</code>`,
+      `<code>#${task.id}</code>` +
+      warn,
     { parse_mode: 'HTML', reply_markup: taskKeyboard(task.id) }
   );
   return task;
 }
+
+async function createRecurrenceFromText(ctx, original, found) {
+  const creator = await upsertUser(ctx.from, ctx.chat);
+  // Время суток и название берём из остатка фразы, дату задаёт само правило
+  const parsed = await parseTask(found.rest || original);
+  const assignee = parsed.assigneeUsername ? await findUserByUsername(parsed.assigneeUsername) : null;
+  const offsets = parsed.offsets.length ? parsed.offsets : DEFAULT_OFFSETS;
+
+  const at = DateTime.fromJSDate(parsed.dueAt).setZone(TZ);
+  const dtstart = DateTime.now()
+    .setZone(TZ)
+    .set({ hour: at.hour, minute: at.minute, second: 0, millisecond: 0 });
+
+  const { rows } = await q(
+    `insert into recurrences
+       (title, rrule, dtstart, tz, is_all_day, assignee_id, creator_id, chat_id, thread_id, offsets)
+     values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) returning *`,
+    [
+      parsed.title,
+      found.rrule,
+      dtstart.toJSDate(),
+      TZ,
+      parsed.isAllDay,
+      assignee?.id || null,
+      creator.id,
+      ctx.chat.id,
+      ctx.message?.message_thread_id || null,
+      JSON.stringify(offsets),
+    ]
+  );
+  const rec = rows[0];
+  const created = await materializeRecurrence(rec);
+
+  const upcoming = occurrencesBetween(rec, new Date(), DateTime.now().plus({ days: 60 }).toJSDate())
+    .slice(0, 3)
+    .map((d) => DateTime.fromJSDate(d).setZone(TZ).toFormat('dd.MM'))
+    .join(', ');
+
+  await ctx.reply(
+    `🔁 <b>${esc(rec.title)}</b>\n` +
+      `📅 ${esc(describeRrule(rec.rrule))}${rec.is_all_day ? '' : ` в ${at.toFormat('HH:mm')}`}\n` +
+      (assignee ? `👤 ${esc(assignee.name)}\n` : '') +
+      `🔔 напомню: ${offsets.map(humanOffset).join(', ')}\n` +
+      (upcoming ? `▶️ ближайшие: ${upcoming}\n` : '') +
+      `создано задач: ${created}\n<code>#R${rec.id}</code>`,
+    { parse_mode: 'HTML' }
+  );
+  return rec;
+}
+
+bot.command('recur', async (ctx) => {
+  const args = (ctx.match || '').trim().split(/\s+/).filter(Boolean);
+  if (args[0] === 'del') {
+    const id = Number(String(args[1] || '').replace(/[#R]/gi, ''));
+    if (!id) return ctx.reply('Формат: /recur del 3');
+    const res = await deactivateRecurrence(id);
+    return ctx.reply(
+      res
+        ? `Правило «${esc(res.recurrence.title)}» отключено, снято будущих задач: ${res.cancelled}`
+        : 'Не нашёл такое правило',
+      { parse_mode: 'HTML' }
+    );
+  }
+
+  const { rows } = await q(
+    `select r.*, u.name as assignee_name
+       from recurrences r left join users u on u.id = r.assignee_id
+      where r.active = true order by r.id`
+  );
+  if (!rows.length) {
+    return ctx.reply(
+      'Повторяющихся задач нет.\n\nПример: <code>каждый вторник в 20:00 вынести мусор</code>',
+      { parse_mode: 'HTML' }
+    );
+  }
+  return ctx.reply(
+    '<b>Повторяющиеся задачи</b>\n\n' +
+      rows
+        .map((r) => {
+          const next = occurrencesBetween(r, new Date(), DateTime.now().plus({ days: 90 }).toJSDate())[0];
+          return (
+            `🔁 <b>${esc(r.title)}</b>${r.assignee_name ? ` — ${esc(r.assignee_name)}` : ''}\n` +
+            `   ${esc(describeRrule(r.rrule))}` +
+            (r.is_all_day ? '' : ` в ${DateTime.fromJSDate(r.dtstart).setZone(TZ).toFormat('HH:mm')}`) +
+            (next ? `, ближайшая ${DateTime.fromJSDate(next).setZone(TZ).toFormat('dd.MM')}` : '') +
+            `  <code>#R${r.id}</code>`
+          );
+        })
+        .join('\n\n') +
+      '\n\nУдалить: <code>/recur del 3</code>',
+    { parse_mode: 'HTML' }
+  );
+});
 
 bot.command('task', (ctx) => {
   const text = (ctx.match || '').trim();
