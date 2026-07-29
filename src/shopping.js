@@ -37,10 +37,12 @@ export async function addItems(text, userId) {
 }
 
 export async function toggleItem(id, userId) {
+  // $2::int обязателен: внутри CASE Postgres не выводит тип параметра
+  // из целевой колонки и падает с «could not determine data type»
   const { rows } = await q(
     `update shopping_items
         set checked = not checked,
-            checked_by = case when checked then null else $2 end,
+            checked_by = case when checked then null else $2::int end,
             checked_at = case when checked then null else now() end
       where id = $1
       returning *`,

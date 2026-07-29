@@ -424,16 +424,28 @@ bot.command('buy', async (ctx) => {
 });
 
 bot.callbackQuery(/^buy_tog:(\d+)$/, async (ctx) => {
-  const user = await upsertUser(ctx.from, ctx.chat);
-  const item = await toggleItem(Number(ctx.match[1]), user.id);
-  await ctx.answerCallbackQuery(item ? (item.checked ? '✅ В корзине' : 'Вернул в список') : 'Нет такого');
-  await refreshMessage(ctx);
+  // Сначала гасим «часики» на кнопке, потом работаем: если запрос упадёт,
+  // пользователь хотя бы увидит реакцию, а не немую кнопку
+  await ctx.answerCallbackQuery();
+  try {
+    const user = await upsertUser(ctx.from, ctx.chat);
+    await toggleItem(Number(ctx.match[1]), user.id);
+    await refreshMessage(ctx);
+  } catch (e) {
+    console.error('[buy_tog] не удалось переключить:', e.message);
+    await ctx.reply('Не получилось отметить товар, попробуйте ещё раз');
+  }
 });
 
 bot.callbackQuery('buy_clear', async (ctx) => {
-  const n = await clearChecked();
-  await ctx.answerCallbackQuery(`Убрано: ${n}`);
-  await refreshMessage(ctx);
+  try {
+    const n = await clearChecked();
+    await ctx.answerCallbackQuery(`Убрано: ${n}`);
+    await refreshMessage(ctx);
+  } catch (e) {
+    console.error('[buy_clear] ошибка:', e.message);
+    await ctx.answerCallbackQuery('Не вышло');
+  }
 });
 
 bot.callbackQuery('buy_add', async (ctx) => {
