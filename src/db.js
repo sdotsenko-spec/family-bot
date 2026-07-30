@@ -90,20 +90,34 @@ export async function setSetting(key, value) {
 
 const STATE_TTL_MIN = Number(process.env.STATE_TTL_MIN || 10);
 
-export async function setState(userId, mode, targetId = null) {
+export async function setState(userId, mode, targetId = null, opts = {}) {
+  const { chatId = null, oneShot = false } = opts;
   await q(
-    `insert into user_state (user_id, mode, target_id, expires_at)
-     values ($1,$2,$3::int, now() + ($4::text || ' minutes')::interval)
+    `insert into user_state (user_id, mode, target_id, chat_id, one_shot, expires_at)
+     values ($1,$2,$3::int,$4::bigint,$5, now() + ($6::text || ' minutes')::interval)
      on conflict (user_id) do update set
-       mode = excluded.mode, target_id = excluded.target_id, expires_at = excluded.expires_at`,
-    [userId, mode, targetId, String(STATE_TTL_MIN)]
+       mode = excluded.mode, target_id = excluded.target_id,
+       chat_id = excluded.chat_id, one_shot = excluded.one_shot,
+       expires_at = excluded.expires_at`,
+    [userId, mode, targetId, chatId, oneShot, String(STATE_TTL_MIN)]
   );
 }
 
-export async function getState(userId) {
+/**
+ * Режим ищем сразу по telegram-id, без upsert пользователя: иначе каждое
+ * сообщение в группе тянуло бы запись в БД.
+ * Совпадение по чату строгое: строка без chat_id (осталась от старой версии)
+ * НЕ считается подходящей — иначе режим, включённый в группе, перехватывал бы
+ * сообщения в личке. Такие строки просто истекут сами.
+ */
+export async function getStateByTg(tgUserId, chatId) {
   const { rows } = await q(
-    `select * from user_state where user_id = $1 and expires_at > now()`,
-    [userId]
+    `select s.*, u.id as uid
+       from user_state s join users u on u.id = s.user_id
+      where u.tg_user_id = $1
+        and s.expires_at > now()
+        and s.chat_id = $2::bigint`,
+    [tgUserId, chatId]
   );
   return rows[0] || null;
 }

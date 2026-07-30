@@ -31,6 +31,8 @@ async function parseWithClaude(text, tz, now) {
 - due_at — ISO 8601 со смещением, в таймзоне ${tz}
 - если время не указано — is_all_day=true, due_at на ${ALL_DAY_HOUR}:00 нужного дня
 - offsets — массив вида ["24h","3h","30m"]; если пользователь не просил — верни []
+- если названо только КОЛИЧЕСТВО напоминаний ("напоминай 2 раза"), верни столько интервалов: 1 → ["30m"], 2 → ["24h","30m"], 3 → ["24h","3h","30m"]
+- любое явно указанное время суток ("в 18:00", "именно в 18:00") ВСЕГДА попадает в due_at, is_all_day при этом false — даже если время названо в конце фразы или повторно
 - assignee — telegram-username без @, если задача явно на кого-то; иначе null
 - title — короткий, без даты/времени/слов про напоминания
 Сейчас: ${now.toISO()} (${tz}).`;
@@ -101,6 +103,15 @@ const MONTHS = {
 
 const DAYPARTS = { утром: 9, утра: 9, днём: 13, днем: 13, вечером: 19, вечера: 19, ночью: 22 };
 
+// «напомни 2 раза» — сколько именно и с какими интервалами.
+// Логика: одно предупреждение заранее плюс одно вплотную к сроку.
+const BY_COUNT = {
+  1: ['30m'],
+  2: ['24h', '30m'],
+  3: ['24h', '3h', '30m'],
+  4: ['24h', '3h', '1h', '15m'],
+};
+
 // Длинные варианты первыми, иначе «ср» съест «среду»
 const alt = (obj) => Object.keys(obj).sort((a, b) => b.length - a.length).join('|');
 
@@ -121,35 +132,54 @@ export function parseFallback(input, tz = TZ, now = DateTime.now().setZone(tz)) 
   let assigneeUsername = null;
   if ((m = eat('@([a-z0-9_]{4,32})'))) assigneeUsername = m[1];
 
-  // 2. «напомни за сутки и за 2 часа»
+  // 2. «напомни за сутки и за 2 часа», «напоминай 2 раза».
+  //    Сканируем ВСЕ вхождения «напомн…», а не первое: в живой речи их
+  //    бывает несколько и они разделены точками.
   const offsets = [];
-  const remindRe = new RegExp(`${B}напомн[а-яё]*([^.!?]*)`, 'iu');
-  const remind = remindRe.exec(text);
-  if (remind) {
-    const re = new RegExp(
-      `за\\s+(\\d+|пару|полчаса)?\\s*(полчаса|сутки|суток|день|дня|дней|час[а-яё]*|минут[а-яё]*|недел[а-яё]*)?`,
-      'giu'
-    );
-    let r;
-    let lastEnd = null; // конец последнего распознанного «за …» внутри блока
-    while ((r = re.exec(remind[1]))) {
-      const unit = (r[2] || r[1] || '').toLowerCase();
-      if (!unit) continue;
-      const n = /^\d+$/.test(r[1] || '') ? Number(r[1]) : r[1] === 'пару' ? 2 : 1;
-      if (unit === 'полчаса') offsets.push('30m');
-      else if (unit.startsWith('сут') || unit.startsWith('де') || unit.startsWith('дн')) offsets.push(`${n * 24}h`);
-      else if (unit.startsWith('час')) offsets.push(`${n}h`);
-      else if (unit.startsWith('минут')) offsets.push(`${n}m`);
-      else if (unit.startsWith('недел')) offsets.push(`${n * 7}d`);
-      else continue;
-      lastEnd = r.index + r[0].length;
+  {
+    const blockRe = new RegExp(`${B}напом[а-яё]*([^.!?]*)`, 'giu');
+    const cuts = [];
+    let block;
+
+    while ((block = blockRe.exec(text))) {
+      const body = block[1];
+      const prefixLen = block[0].length - body.length;
+      let lastEnd = null;
+
+      const re = new RegExp(
+        `за\\s+(\\d+|пару|полчаса)?\\s*(полчаса|сутки|суток|день|дня|дней|час[а-яё]*|минут[а-яё]*|недел[а-яё]*)`,
+        'giu'
+      );
+      let r;
+      while ((r = re.exec(body))) {
+        const unit = (r[2] || '').toLowerCase();
+        if (!unit) continue;
+        const n = /^\d+$/.test(r[1] || '') ? Number(r[1]) : r[1] === 'пару' ? 2 : 1;
+        if (unit === 'полчаса') offsets.push('30m');
+        else if (unit.startsWith('сут') || unit.startsWith('де') || unit.startsWith('дн')) offsets.push(`${n * 24}h`);
+        else if (unit.startsWith('час')) offsets.push(`${n}h`);
+        else if (unit.startsWith('минут')) offsets.push(`${n}m`);
+        else if (unit.startsWith('недел')) offsets.push(`${n * 7}d`);
+        else continue;
+        lastEnd = r.index + r[0].length;
+      }
+
+      // Интервалы не названы, но указано количество: «напоминай 2 раза»
+      if (lastEnd === null) {
+        const cnt = /(\d+)\s*раз[а-яё]*/iu.exec(body);
+        if (cnt && BY_COUNT[Number(cnt[1])]) {
+          offsets.push(...BY_COUNT[Number(cnt[1])]);
+          lastEnd = cnt.index + cnt[0].length;
+        }
+      }
+
+      // Вырезаем от «напомни» до конца распознанного, а не до конца фразы:
+      // иначе «напомни за час купить хлеб» потеряет сам текст задачи
+      if (lastEnd !== null) cuts.push([block.index, block.index + prefixLen + lastEnd]);
     }
-    // Вырезаем от «напомни» до конца последнего офсета, а НЕ до конца строки:
-    // иначе «напомни за час купить хлеб» потеряет сам текст задачи.
-    if (offsets.length) {
-      const prefixLen = remind[0].length - remind[1].length;
-      const cutTo = remind.index + prefixLen + lastEnd;
-      text = (text.slice(0, remind.index) + ' ' + text.slice(cutTo)).replace(/\s+/g, ' ');
+
+    for (const [from, to] of cuts.reverse()) {
+      text = (text.slice(0, from) + ' ' + text.slice(to)).replace(/\s+/g, ' ');
     }
   }
 
@@ -229,7 +259,11 @@ export function parseFallback(input, tz = TZ, now = DateTime.now().setZone(tz)) 
 
   const title = text
     .replace(/\s+/g, ' ')
-    .replace(new RegExp(`^(?:напомн[а-яё]*|поставь|задача|таска|добавь|нужно|надо)${E}\\s*`, 'iu'), '')
+    // после вырезания фрагментов остаются «висячие» знаки: «счетчики. , именно»
+    .replace(/([.,;:])\s*(?=[.,;:])/g, '')
+    .replace(/\s+([.,;:])/g, '$1')
+    .replace(new RegExp(`^(?:(?:напом[а-яё]*|поставь|задача|таска|добавь|нужно|надо|именно|мне)${E}\\s*)+`, 'iu'), '')
+    .replace(new RegExp(`${B}(?:и|именно)${E}\\s*$`, 'iu'), '')
     .replace(new RegExp(`${B}(?:во?|на|к)${E}\\s*$`, 'iu'), '')
     .replace(/^[\s,.\-–—]+|[\s,.\-–—]+$/g, '')
     .trim();

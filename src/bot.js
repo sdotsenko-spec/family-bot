@@ -1,5 +1,5 @@
 import { Bot, InlineKeyboard, Keyboard } from 'grammy';
-import { q, withTx, getSetting, setSetting, setState, getState, clearState } from './db.js';
+import { q, withTx, getSetting, setSetting, setState, getStateByTg, clearState } from './db.js';
 import { parseTask } from './parser.js';
 import {
   regenerateReminders,
@@ -9,7 +9,7 @@ import {
 } from './reminders.js';
 import { DateTime, TZ, fmt, humanOffset } from './time.js';
 import { syncAllCalendars } from './calendar/ics.js';
-import { addItems, toggleItem, clearChecked, renderList, refreshMessage } from './shopping.js';
+import { addItems, toggleItem, clearChecked, renderList, refreshMessage, looksLikeTask } from './shopping.js';
 import {
   parseRecurrence,
   looksRecurring,
@@ -95,6 +95,7 @@ function recurKeyboard(id) {
 
 bot.command('start', async (ctx) => {
   const user = await upsertUser(ctx.from, ctx.chat);
+  await clearState(user.id); // на случай залипшего режима ввода
   if (ctx.chat.type !== 'private') {
     await setSetting('family_chat_id', ctx.chat.id);
     if (ctx.message.message_thread_id) {
@@ -437,6 +438,9 @@ bot.callbackQuery(/^buy_tog:(\d+)$/, async (ctx) => {
   }
 });
 
+// Разделитель «Корзина» — кнопка только для вида
+bot.callbackQuery('noop', (ctx) => ctx.answerCallbackQuery());
+
 bot.callbackQuery('buy_clear', async (ctx) => {
   try {
     const n = await clearChecked();
@@ -450,11 +454,18 @@ bot.callbackQuery('buy_clear', async (ctx) => {
 
 bot.callbackQuery('buy_add', async (ctx) => {
   const user = await upsertUser(ctx.from, ctx.chat);
-  await setState(user.id, 'shopping');
+  const isPrivate = ctx.chat.type === 'private';
+
+  // В группе режим одноразовый: одно сообщение с товарами и выход.
+  // Иначе кнопка на десять минут перехватывала бы общую переписку.
+  await setState(user.id, 'shopping', null, { chatId: ctx.chat.id, oneShot: !isPrivate });
   await ctx.answerCallbackQuery();
+
   await ctx.reply(
-    'Пишите товары — можно списком через запятую или с новой строки.\nКогда закончите, нажмите «Выйти».',
-    { reply_markup: ctx.chat.type === 'private' ? exitKeyboard : undefined }
+    isPrivate
+      ? 'Пишите товары — можно списком через запятую или с новой строки.\nКогда закончите, нажмите «Выйти».'
+      : 'Пришлите товары одним сообщением — через запятую или с новой строки.',
+    { reply_markup: isPrivate ? exitKeyboard : undefined }
   );
 });
 
@@ -500,7 +511,7 @@ bot.command('edit', async (ctx) => {
 
 bot.callbackQuery(/^edit:(\d+)$/, async (ctx) => {
   const user = await upsertUser(ctx.from, ctx.chat);
-  await setState(user.id, 'edit', Number(ctx.match[1]));
+  await setState(user.id, 'edit', Number(ctx.match[1]), { chatId: ctx.chat.id, oneShot: true });
   await ctx.answerCallbackQuery();
   await ctx.reply(
     `Пришлите новый текст задачи <code>#${ctx.match[1]}</code> — с датой и временем, как при создании.`,
@@ -521,40 +532,52 @@ bot.on('message:text', async (ctx) => {
   const isPrivate = ctx.chat.type === 'private';
   const replied = ctx.message.reply_to_message;
 
-  // В группе не перехватываем всю болтовню — только явные «+задача».
-  // Ранний выход заодно экономит запрос в БД на каждое сообщение чата.
-  if (!isPrivate && !text.startsWith('+')) return;
-
-  const user = await upsertUser(ctx.from, ctx.chat);
-
-  // 1. Кнопки нижней клавиатуры
+  // 1. Кнопки нижней клавиатуры (они есть только в личке)
   if (isPrivate) {
     if (text === '🛒 Покупки') return showShoppingList(ctx);
     if (text === '📋 Сегодня') return showToday(ctx);
     if (text === '📆 Неделя') return showWeek(ctx);
     if (text === '🔁 Повторы') return showRecurrences(ctx);
     if (text === '✅ Выйти') {
-      await clearState(user.id);
+      const u = await upsertUser(ctx.from, ctx.chat);
+      await clearState(u.id);
       return ctx.reply('Готово.', { reply_markup: mainKeyboard });
     }
   }
 
-  // 2. Активный режим ввода — сообщение уходит не в задачи
-  const state = await getState(user.id);
+  // 2. Активный режим ввода проверяем ДО правила «в группе только с плюсом» —
+  //    иначе в группе кнопка «Добавить» не работала бы вовсе.
+  //    Поиск сразу по telegram-id, без записи в БД на каждое сообщение чата.
+  const state = await getStateByTg(ctx.from.id, ctx.chat.id);
+
   if (state?.mode === 'shopping') {
-    const added = await addItems(text, user.id);
-    await ctx.reply(
-      added.length ? `🛒 ${esc(added.join(', '))}` : 'Это уже в списке',
-      { parse_mode: 'HTML' }
-    );
-    return;
+    if (looksLikeTask(text)) {
+      // Человек забыл, что включён режим списка — не хороним задачу в покупках
+      await clearState(state.uid);
+      await ctx.reply('Это больше похоже на задачу, чем на покупку — вышел из режима списка.', {
+        reply_markup: isPrivate ? mainKeyboard : undefined,
+      });
+      // и падаем ниже, в обычное создание задачи
+    } else {
+      const added = await addItems(text, state.uid);
+      if (state.one_shot) await clearState(state.uid);
+      await ctx.reply(
+        added.length ? `🛒 Добавлено: ${esc(added.join(', '))}` : 'Это уже в списке',
+        { parse_mode: 'HTML' }
+      );
+      return showShoppingList(ctx);
+    }
   }
+
   if (state?.mode === 'edit') {
-    await clearState(user.id);
+    await clearState(state.uid);
     return applyEdit(ctx, state.target_id, text);
   }
 
-  // 3. Ответ на чужое сообщение: текст оттуда становится задачей,
+  // 3. В группе не перехватываем всю болтовню — только явные «+задача»
+  if (!isPrivate && !text.startsWith('+')) return;
+
+  // 4. Ответ на чужое сообщение: текст оттуда становится задачей,
   //    а написанное сейчас — уточнением времени
   let payload = isPrivate ? text : text.slice(1).trim();
   if (replied && !replied.from?.is_bot) {

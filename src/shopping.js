@@ -17,6 +17,21 @@ export function splitItems(text) {
     .filter((s) => s.length > 0 && s.length <= 120);
 }
 
+/**
+ * Похоже ли сообщение на задачу, а не на товар.
+ * Нужно как страховка: если человек забыл, что включён режим списка,
+ * «завтра в 14:00 собеседование» не должно молча стать покупкой.
+ * Продукты не содержат времени, дат и слова «напомни».
+ */
+export function looksLikeTask(text) {
+  const t = text.toLowerCase();
+  if (/\d{1,2}:\d{2}/.test(t)) return true;
+  if (/(?<![а-яё])(завтра|послезавтра|сегодня|напом[а-яё]*|через\s+\d|в\s+\d{1,2}\s*(час|:))/u.test(t))
+    return true;
+  if (/(?<![а-яё])кажд[а-яё]*(?![а-яё])/u.test(t)) return true;
+  return text.length > 90;
+}
+
 export async function addItems(text, userId) {
   const items = splitItems(text);
   const added = [];
@@ -70,15 +85,26 @@ export async function renderList() {
   const done = items.filter((i) => i.checked);
 
   const kb = new InlineKeyboard();
-  for (const item of items.slice(0, MAX_SHOWN)) {
-    kb.text(`${item.checked ? '✅' : '☐'} ${item.title}`, `buy_tog:${item.id}`).row();
+
+  for (const item of open.slice(0, MAX_SHOWN)) {
+    kb.text(`☐ ${item.title}`, `buy_tog:${item.id}`).row();
   }
+
+  // Купленное уезжает в «корзину» под разделитель, но остаётся кнопкой —
+  // чтобы можно было снять галочку, если промахнулся
+  if (done.length) {
+    kb.text(`— 🧺 Корзина (${done.length}) —`, 'noop').row();
+    for (const item of done.slice(0, MAX_SHOWN)) {
+      kb.text(`✅ ${item.title}`, `buy_tog:${item.id}`).row();
+    }
+  }
+
   kb.text('➕ Добавить', 'buy_add');
-  if (done.length) kb.text('🧹 Убрать купленное', 'buy_clear');
+  if (done.length) kb.text('🧹 Очистить корзину', 'buy_clear');
 
   const text = items.length
     ? `🛒 <b>Список покупок</b>\nНужно купить: ${open.length}` +
-      (done.length ? `, в корзине: ${done.length}` : '') +
+      (done.length ? ` · в корзине: ${done.length}` : '') +
       (items.length > MAX_SHOWN ? `\n<i>показаны первые ${MAX_SHOWN}</i>` : '')
     : `🛒 <b>Список покупок</b>\nПусто. Нажмите «Добавить» или напишите <code>/buy молоко, хлеб</code>`;
 
