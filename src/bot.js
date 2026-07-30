@@ -10,6 +10,7 @@ import {
 import { DateTime, TZ, fmt, humanOffset } from './time.js';
 import { syncAllCalendars } from './calendar/ics.js';
 import { addItems, toggleItem, clearChecked, renderList, refreshMessage, looksLikeTask } from './shopping.js';
+import { parseFallback } from './parser.js';
 import {
   parseRecurrence,
   looksRecurring,
@@ -138,6 +139,36 @@ bot.command('help', (ctx) =>
     { parse_mode: 'HTML' }
   )
 );
+
+// Диагностика: показывает, как именно бот разобрал фразу и каким путём.
+// Нужна, чтобы не гадать по скриншотам, что именно крутится в проде.
+bot.command('parse', async (ctx) => {
+  const text = (ctx.match || '').trim();
+  if (!text) return ctx.reply('Формат: /parse каждое 29 число в 19:00 снять показания');
+
+  const viaLlm = Boolean(process.env.ANTHROPIC_API_KEY);
+  const rec = parseRecurrence(text);
+  const rest = rec ? rec.rest : text;
+
+  const llm = await parseTask(rest);          // тот же путь, что при создании
+  const regex = parseFallback(rest);          // всегда регулярки, для сравнения
+
+  const show = (p) =>
+    `${DateTime.fromJSDate(p.dueAt).setZone(TZ).toFormat('dd.MM HH:mm')}` +
+    `${p.isAllDay ? ' (весь день)' : ''}\n` +
+    `      напоминания: ${p.offsets.length ? p.offsets.join(', ') : '— (будут по умолчанию)'}\n` +
+    `      название: «${esc(p.title)}»`;
+
+  return ctx.reply(
+    `<b>Разбор</b>\n` +
+      `повтор: ${rec ? esc(describeRrule(rec.rrule)) + ` <code>${esc(rec.rrule)}</code>` : 'нет'}\n` +
+      `остаток: «${esc(rest)}»\n\n` +
+      `<b>Итог</b> (${viaLlm ? 'через Claude' : 'регулярки'})\n      ${show(llm)}\n\n` +
+      (viaLlm ? `<b>Регулярки для сравнения</b>\n      ${show(regex)}\n\n` : '') +
+      `<i>таймзона ${TZ}</i>`,
+    { parse_mode: 'HTML' }
+  );
+});
 
 bot.command('tz', (ctx) => ctx.reply(`Таймзона: ${TZ}. Сейчас: ${DateTime.now().setZone(TZ).toFormat('dd.MM HH:mm')}`));
 

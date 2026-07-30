@@ -164,6 +164,14 @@ export function parseFallback(input, tz = TZ, now = DateTime.now().setZone(tz)) 
         lastEnd = r.index + r[0].length;
       }
 
+      // «напомни в день события» — напоминание в момент срока создаётся
+      // всегда, отдельного офсета не нужно; просто убираем формулировку,
+      // чтобы она не оседала в названии задачи
+      if (lastEnd === null) {
+        const sameDay = /в\s+(?:сам[а-яё]*\s+)?(?:день|дату)\s+событи[а-яё]*|в\s+этот\s+день/iu.exec(body);
+        if (sameDay) lastEnd = sameDay.index + sameDay[0].length;
+      }
+
       // Интервалы не названы, но указано количество: «напоминай 2 раза»
       if (lastEnd === null) {
         const cnt = /(\d+)\s*раз[а-яё]*/iu.exec(body);
