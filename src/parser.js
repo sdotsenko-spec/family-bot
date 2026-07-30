@@ -132,26 +132,44 @@ export function parseFallback(input, tz = TZ, now = DateTime.now().setZone(tz)) 
   let assigneeUsername = null;
   if ((m = eat('@([a-z0-9_]{4,32})'))) assigneeUsername = m[1];
 
-  // 2. «напомни за сутки и за 2 часа», «напоминай 2 раза».
-  //    Сканируем ВСЕ вхождения «напомн…», а не первое: в живой речи их
-  //    бывает несколько и они разделены точками.
+  // 2. Оговорки про напоминания: «напомни за сутки и за 2 часа»,
+  //    «напоминай 2 раза», «напомни в 9:00 и в 19:00», «в день события».
+  //
+  //    Ключевой момент: разбираем не «всё до точки», а именно оговорку —
+  //    цепочку допустимых кусочков подряд. Иначе во фразе
+  //    «напомни 2 раза полить цветы завтра в 15:00» сканер принял бы
+  //    время самой задачи за время напоминания и съел бы всю фразу.
   const offsets = [];
+  const absoluteTimes = [];
   {
-    const blockRe = new RegExp(`${B}напом[а-яё]*([^.!?]*)`, 'giu');
+    const INTERVAL = `за\\s+(?:\\d+|пару|полчаса)?\\s*(?:полчаса|сутки|суток|день|дня|дней|час[а-яё]*|минут[а-яё]*|недел[а-яё]*)`;
+    const AT_TIME = `(?:в\\s+)?\\d{1,2}[:.]\\d{2}`;
+    const AT_HOUR = `в\\s+\\d{1,2}(?![:.\\d])(?:\\s*часов)?`;
+    const COUNT = `\\d+\\s*раз[а-яё]*`;
+    const SAME_DAY = `в\\s+(?:сам[а-яё]*\\s+)?(?:день|дату)\\s+событи[а-яё]*|в\\s+этот\\s+день`;
+    // Голый час допускается только как продолжение: «в 9 и 19».
+    // Диапазон 0–23, иначе «и 30 минут» приняли бы за время.
+    const BARE_HOUR = `(?:[01]?\\d|2[0-3])(?![:.\\d])`;
+    const PIECE = `(?:${INTERVAL}|${AT_TIME}|${AT_HOUR}|${COUNT}|${SAME_DAY}|${BARE_HOUR})`;
+    const clauseRe = new RegExp(`^(?:\\s*(?:и|,|плюс|а\\s+также)?\\s*${PIECE})+`, 'iu');
+
+    const blockRe = new RegExp(`${B}напом[а-яё]*`, 'giu');
     const cuts = [];
     let block;
 
     while ((block = blockRe.exec(text))) {
-      const body = block[1];
-      const prefixLen = block[0].length - body.length;
-      let lastEnd = null;
+      const after = text.slice(block.index + block[0].length);
+      const clauseM = clauseRe.exec(after);
+      if (!clauseM) continue;
+      const clause = clauseM[0];
 
+      // а) явные интервалы
       const re = new RegExp(
         `за\\s+(\\d+|пару|полчаса)?\\s*(полчаса|сутки|суток|день|дня|дней|час[а-яё]*|минут[а-яё]*|недел[а-яё]*)`,
         'giu'
       );
       let r;
-      while ((r = re.exec(body))) {
+      while ((r = re.exec(clause))) {
         const unit = (r[2] || '').toLowerCase();
         if (!unit) continue;
         const n = /^\d+$/.test(r[1] || '') ? Number(r[1]) : r[1] === 'пару' ? 2 : 1;
@@ -160,30 +178,34 @@ export function parseFallback(input, tz = TZ, now = DateTime.now().setZone(tz)) 
         else if (unit.startsWith('час')) offsets.push(`${n}h`);
         else if (unit.startsWith('минут')) offsets.push(`${n}m`);
         else if (unit.startsWith('недел')) offsets.push(`${n * 7}d`);
-        else continue;
-        lastEnd = r.index + r[0].length;
       }
 
-      // «напомни в день события» — напоминание в момент срока создаётся
-      // всегда, отдельного офсета не нужно; просто убираем формулировку,
-      // чтобы она не оседала в названии задачи
-      if (lastEnd === null) {
-        const sameDay = /в\s+(?:сам[а-яё]*\s+)?(?:день|дату)\s+событи[а-яё]*|в\s+этот\s+день/iu.exec(body);
-        if (sameDay) lastEnd = sameDay.index + sameDay[0].length;
+      // б) абсолютные времена — переведём в интервалы, когда узнаем срок
+      const timeRe = /(?:в\s+)?(\d{1,2})[:.](\d{2})/giu;
+      let tm;
+      while ((tm = timeRe.exec(clause))) {
+        const h = Number(tm[1]);
+        const mi = Number(tm[2]);
+        if (h <= 23 && mi <= 59) absoluteTimes.push({ h, m: mi });
       }
-
-      // Интервалы не названы, но указано количество: «напоминай 2 раза»
-      if (lastEnd === null) {
-        const cnt = /(\d+)\s*раз[а-яё]*/iu.exec(body);
-        if (cnt && BY_COUNT[Number(cnt[1])]) {
-          offsets.push(...BY_COUNT[Number(cnt[1])]);
-          lastEnd = cnt.index + cnt[0].length;
+      // Голые часы ищем только если явных интервалов и количества нет —
+      // иначе «за сутки и за 2 часа» дало бы «в 2 часа ночи»
+      if (!absoluteTimes.length && !offsets.length && !/раз[а-яё]*/iu.test(clause)) {
+        const bareRe = /(?:в\s+)?(\d{1,2})(?![:.\d])/giu;
+        let bm;
+        while ((bm = bareRe.exec(clause))) {
+          const h = Number(bm[1]);
+          if (h <= 23) absoluteTimes.push({ h, m: 0 });
         }
       }
 
-      // Вырезаем от «напомни» до конца распознанного, а не до конца фразы:
-      // иначе «напомни за час купить хлеб» потеряет сам текст задачи
-      if (lastEnd !== null) cuts.push([block.index, block.index + prefixLen + lastEnd]);
+      // в) только количество: «напоминай 2 раза»
+      if (!offsets.length && !absoluteTimes.length) {
+        const cnt = /(\d+)\s*раз[а-яё]*/iu.exec(clause);
+        if (cnt && BY_COUNT[Number(cnt[1])]) offsets.push(...BY_COUNT[Number(cnt[1])]);
+      }
+
+      cuts.push([block.index, block.index + block[0].length + clause.length]);
     }
 
     for (const [from, to] of cuts.reverse()) {
@@ -247,6 +269,7 @@ export function parseFallback(input, tz = TZ, now = DateTime.now().setZone(tz)) 
   }
 
   const isAllDay = hour === null;
+  let isAllDayResolved = isAllDay;
 
   if (!date) {
     date = now;
@@ -261,6 +284,25 @@ export function parseFallback(input, tz = TZ, now = DateTime.now().setZone(tz)) 
     second: 0,
     millisecond: 0,
   });
+
+  // Абсолютные времена напоминаний → интервалы до срока.
+  // Если сам срок не назван, берём самое позднее из них как срок задачи:
+  // «напомни в 9 и 19» естественнее всего читается как «событие в 19, плюс
+  // раннее предупреждение в 9».
+  if (absoluteTimes.length) {
+    const sorted = [...absoluteTimes].sort((a, b) => a.h * 60 + a.m - (b.h * 60 + b.m));
+    if (isAllDay) {
+      const last = sorted.pop();
+      dueAt = dueAt.set({ hour: last.h, minute: last.m });
+      isAllDayResolved = false;
+    }
+    for (const t of sorted) {
+      const at = dueAt.set({ hour: t.h, minute: t.m, second: 0, millisecond: 0 });
+      const diffMin = Math.round(dueAt.diff(at, 'minutes').minutes);
+      if (diffMin <= 0) continue; // время после срока — пропускаем
+      offsets.push(diffMin % 60 === 0 ? `${diffMin / 60}h` : `${diffMin}m`);
+    }
+  }
 
   // Задача без даты, а опорный час уже прошёл → на завтра, а не в прошлое
   if (dueAt < now) dueAt = dueAt.plus({ days: 1 });
@@ -279,7 +321,7 @@ export function parseFallback(input, tz = TZ, now = DateTime.now().setZone(tz)) 
   return {
     title: title || input.trim(),
     dueAt: dueAt.toJSDate(),
-    isAllDay,
+    isAllDay: isAllDayResolved,
     offsets,
     assigneeUsername,
   };
