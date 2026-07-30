@@ -25,11 +25,12 @@ export function splitItems(text) {
  */
 export function looksLikeTask(text) {
   const t = text.toLowerCase();
+  // Только явные признаки времени. Длину списка как признак использовать
+  // нельзя: настоящий список продуктов почти всегда длинный.
   if (/\d{1,2}:\d{2}/.test(t)) return true;
-  if (/(?<![а-яё])(завтра|послезавтра|сегодня|напом[а-яё]*|через\s+\d|в\s+\d{1,2}\s*(час|:))/u.test(t))
-    return true;
+  if (/(?<![а-яё])(завтра|послезавтра|сегодня|напом[а-яё]*|через\s+\d)/u.test(t)) return true;
   if (/(?<![а-яё])кажд[а-яё]*(?![а-яё])/u.test(t)) return true;
-  return text.length > 90;
+  return false;
 }
 
 export async function addItems(text, userId) {
