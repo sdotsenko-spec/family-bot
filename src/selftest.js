@@ -212,5 +212,15 @@ for (const [label, expected] of [
   }
 }
 
+// --- счётчики ---------------------------------------------------------------
+{
+  const { extractNumbers, isMeterTask } = await import('./meters.js');
+  check2('числа из свободного текста', extractNumbers('вода 1234,5 свет 567'), [1234.5, 567]);
+  check2('ведущие нули и точка', extractNumbers('001234.750, 000876'), [1234.75, 876]);
+  check2('нет чисел', extractNumbers('нет чисел тут'), []);
+  check2('«сфоткать счетчики» → задача про счётчики', isMeterTask('сфоткать счетчики'), true);
+  check2('«купить хлеб» → не про счётчики', isMeterTask('купить хлеб'), false);
+}
+
 console.log(failures ? `\n${failures} провалов` : '\nВсё зелёное');
 process.exit(failures ? 1 : 0);

@@ -12,6 +12,17 @@ import { syncAllCalendars } from './calendar/ics.js';
 import { addItems, toggleItem, clearChecked, renderList, refreshMessage, looksLikeTask } from './shopping.js';
 import { parseFallback } from './parser.js';
 import {
+  isMeterTask,
+  listMeters,
+  addMeter,
+  removeMeter,
+  extractNumbers,
+  saveReadings,
+  renderReport,
+  renderSummary,
+  renderPrompt,
+} from './meters.js';
+import {
   parseRecurrence,
   looksRecurring,
   describeRrule,
@@ -74,17 +85,30 @@ function taskLine(t) {
   return `${mark} <b>${esc(t.title)}</b>${who}\n   ${fmt(new Date(t.due_at), t.tz || TZ, t.is_all_day)}  <code>#${t.id}</code>`;
 }
 
-function taskKeyboard(id, recurrenceId = null) {
+function taskKeyboard(id, recurrenceId = null, title = '') {
   const kb = new InlineKeyboard()
     .text('✅ Готово', `done:${id}`)
-    .text('⏰ +1 час', `snooze:${id}:60`)
-    .row()
-    .text('📅 Завтра', `tomorrow:${id}`)
-    .text('🗑 Удалить', `drop:${id}`)
-    .row()
-    .text('✏️ Изменить', `edit:${id}`);
-  if (recurrenceId) kb.text('🚫 Отключить повтор', `drop_recur:${recurrenceId}`);
+    .text('⏰ Отложить', `snoozemenu:${id}`)
+    .row();
+  if (isMeterTask(title)) kb.text('📟 Внести показания', `meter_input:${id}`).row();
+  kb.text('🗑 Удалить', `drop:${id}`).text('✏️ Изменить', `edit:${id}`);
+  if (recurrenceId) kb.row().text('🚫 Отключить повтор', `drop_recur:${recurrenceId}`);
   return kb;
+}
+
+/** Подменю «Отложить»: раскрывается на месте, чтобы не плодить кнопки. */
+function snoozeKeyboard(id) {
+  return new InlineKeyboard()
+    .text('1 час', `snooze:${id}:60`)
+    .text('3 часа', `snooze:${id}:180`)
+    .row()
+    .text('Вечером', `snoozeto:${id}:evening`)
+    .text('Завтра утром', `snoozeto:${id}:morning`)
+    .row()
+    .text('В выходные', `snoozeto:${id}:weekend`)
+    .text('Через неделю', `snooze:${id}:10080`)
+    .row()
+    .text('← Назад', `snoozeback:${id}`);
 }
 
 /** Клавиатура под карточкой правила. */
@@ -132,7 +156,8 @@ bot.command('help', (ctx) =>
       `<b>Команды</b>\n` +
       `/today — что сегодня\n/week — на неделю\n/list — все открытые\n` +
       `/done ID — закрыть\n/del ID — удалить\n/edit ID текст — изменить\n` +
-      `/buy — список покупок\n/recur — повторяющиеся задачи\n` +
+      `/buy — список покупок\n/meter — счётчики и показания\n` +
+      `/recur — повторяющиеся задачи\n` +
       `/cal add URL — подключить календарь (ссылка .ics)\n` +
       `/cal list, /cal del ID\n/sync — синхронизировать календари сейчас\n` +
       `/tz — текущая таймзона`,
@@ -341,7 +366,7 @@ async function createTaskFromText(ctx, text) {
       `<code>#${task.id}</code>` +
       overdue +
       warn,
-    { parse_mode: 'HTML', reply_markup: taskKeyboard(task.id, task.recurrence_id) }
+    { parse_mode: 'HTML', reply_markup: taskKeyboard(task.id, task.recurrence_id, task.title) }
   );
   return task;
 }
@@ -536,7 +561,7 @@ async function applyEdit(ctx, id, text) {
   if (!task) return ctx.reply('Не нашёл такую открытую задачу');
   return ctx.reply(
     `✏️ <b>${esc(task.title)}</b>\n🗓 ${fmt(new Date(task.due_at), TZ, task.is_all_day)}\n<code>#${task.id}</code>`,
-    { parse_mode: 'HTML', reply_markup: taskKeyboard(task.id, task.recurrence_id) }
+    { parse_mode: 'HTML', reply_markup: taskKeyboard(task.id, task.recurrence_id, task.title) }
   );
 }
 
@@ -607,6 +632,20 @@ bot.on('message:text', async (ctx) => {
     }
   }
 
+  if (state?.mode === 'meter') {
+    const numbers = extractNumbers(text);
+    if (numbers.length) {
+      await clearState(state.uid);
+      const result = await saveReadings(numbers, state.uid);
+      await ctx.reply(renderReport(result), { parse_mode: 'HTML' });
+      // Задачу «снять показания» закрываем сразу — она выполнена
+      if (state.target_id) await completeTask(state.target_id, state.uid);
+      return;
+    }
+    await ctx.reply('Не нашёл чисел. Пришлите показания цифрами или нажмите «Выйти».');
+    return;
+  }
+
   if (state?.mode === 'edit') {
     await clearState(state.uid);
     return applyEdit(ctx, state.target_id, text);
@@ -652,9 +691,107 @@ bot.callbackQuery(/^snooze:(\d+):(\d+)$/, async (ctx) => {
   if (task) {
     await ctx.editMessageText(
       `⏰ <b>${esc(task.title)}</b>\nперенесено на ${fmt(new Date(task.due_at), TZ)}`,
-      { parse_mode: 'HTML', reply_markup: taskKeyboard(task.id) }
+      { parse_mode: 'HTML', reply_markup: taskKeyboard(task.id, task.recurrence_id, task.title) }
     );
   }
+});
+
+bot.callbackQuery(/^snoozemenu:(\d+)$/, async (ctx) => {
+  await ctx.answerCallbackQuery();
+  await ctx.editMessageReplyMarkup({ reply_markup: snoozeKeyboard(Number(ctx.match[1])) });
+});
+
+bot.callbackQuery(/^snoozeback:(\d+)$/, async (ctx) => {
+  const id = Number(ctx.match[1]);
+  const { rows } = await q('select recurrence_id, title from tasks where id=$1', [id]);
+  await ctx.answerCallbackQuery();
+  await ctx.editMessageReplyMarkup({
+    reply_markup: taskKeyboard(id, rows[0]?.recurrence_id, rows[0]?.title),
+  });
+});
+
+/**
+ * Именованные сдвиги. Считаем от «сейчас», а не от старого срока:
+ * «вечером» должно означать сегодня вечером, даже если задача была на утро.
+ */
+bot.callbackQuery(/^snoozeto:(\d+):(evening|morning|weekend)$/, async (ctx) => {
+  const id = Number(ctx.match[1]);
+  const kind = ctx.match[2];
+  const now = DateTime.now().setZone(TZ);
+  let target;
+
+  if (kind === 'evening') {
+    target = now.set({ hour: 19, minute: 0, second: 0, millisecond: 0 });
+    if (target <= now) target = target.plus({ days: 1 });
+  } else if (kind === 'morning') {
+    target = now.plus({ days: 1 }).set({ hour: 9, minute: 0, second: 0, millisecond: 0 });
+  } else {
+    // ближайшая суббота, 10 утра; если сегодня суббота — следующая
+    target = now.set({ hour: 10, minute: 0, second: 0, millisecond: 0 });
+    do {
+      target = target.plus({ days: 1 });
+    } while (target.weekday !== 6);
+  }
+
+  const task = await rescheduleTask(id, target.toJSDate());
+  await ctx.answerCallbackQuery(task ? 'Перенёс' : 'Задача не найдена');
+  if (task) {
+    await ctx.editMessageText(
+      `⏰ <b>${esc(task.title)}</b>\nперенесено на ${fmt(new Date(task.due_at), TZ, task.is_all_day)}`,
+      { parse_mode: 'HTML', reply_markup: taskKeyboard(task.id, task.recurrence_id, task.title) }
+    );
+  }
+});
+
+// --- счётчики ---------------------------------------------------------------
+
+bot.command('meter', async (ctx) => {
+  const args = (ctx.match || '').trim().split(/\s+/).filter(Boolean);
+  const sub = (args.shift() || '').toLowerCase();
+
+  if (sub === 'add') {
+    if (!args.length) return ctx.reply('Формат: /meter add Вода холодная м3');
+    // последнее слово — единица измерения, если она короткая и не часть названия
+    let unit = '';
+    if (args.length > 1 && args[args.length - 1].length <= 6) unit = args.pop();
+    const meter = await addMeter(args.join(' '), unit);
+    await ctx.reply(`📟 Добавил: <b>${esc(meter.name)}</b>${meter.unit ? ` (${esc(meter.unit)})` : ''}`, {
+      parse_mode: 'HTML',
+    });
+    return ctx.reply(await renderSummary(), { parse_mode: 'HTML' });
+  }
+
+  if (sub === 'del') {
+    const id = Number(String(args.shift() || '').replace(/[#M]/gi, ''));
+    if (!id) return ctx.reply('Формат: /meter del 2');
+    const gone = await removeMeter(id);
+    return ctx.reply(gone ? `Убрал: ${esc(gone.name)}` : 'Не нашёл такой счётчик', {
+      parse_mode: 'HTML',
+    });
+  }
+
+  // Числа прямо в команде: /meter 1234 567
+  const numbers = extractNumbers((ctx.match || '').trim());
+  if (numbers.length) {
+    const user = await upsertUser(ctx.from, ctx.chat);
+    const result = await saveReadings(numbers, user.id);
+    return ctx.reply(renderReport(result), { parse_mode: 'HTML' });
+  }
+
+  return ctx.reply(await renderSummary(), { parse_mode: 'HTML' });
+});
+
+bot.callbackQuery(/^meter_input:(\d+)$/, async (ctx) => {
+  const user = await upsertUser(ctx.from, ctx.chat);
+  const meters = await listMeters();
+  await ctx.answerCallbackQuery();
+  if (!meters.length) {
+    return ctx.reply('Сначала заведите счётчики: <code>/meter add Вода холодная м3</code>', {
+      parse_mode: 'HTML',
+    });
+  }
+  await setState(user.id, 'meter', Number(ctx.match[1]), { chatId: ctx.chat.id, oneShot: true });
+  return ctx.reply(await renderPrompt(), { parse_mode: 'HTML' });
 });
 
 bot.callbackQuery(/^tomorrow:(\d+)$/, async (ctx) => {
@@ -669,7 +806,7 @@ bot.callbackQuery(/^tomorrow:(\d+)$/, async (ctx) => {
   await ctx.answerCallbackQuery('Перенёс на завтра');
   await ctx.editMessageText(
     `📅 <b>${esc(task.title)}</b>\n${fmt(new Date(task.due_at), TZ, task.is_all_day)}`,
-    { parse_mode: 'HTML', reply_markup: taskKeyboard(task.id) }
+    { parse_mode: 'HTML', reply_markup: taskKeyboard(task.id, task.recurrence_id, task.title) }
   );
 });
 

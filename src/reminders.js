@@ -1,6 +1,7 @@
 import { InlineKeyboard } from 'grammy';
 import { q, withTx, getSetting } from './db.js';
 import { offsetToMs, humanOffset, fmt, TZ } from './time.js';
+import { isMeterTask } from './meters.js';
 
 export const DEFAULT_OFFSETS = ['24h', '3h', '30m'];
 
@@ -104,10 +105,15 @@ async function claimDue(limit = 25) {
 function buildKeyboard(task) {
   const kb = new InlineKeyboard()
     .text('✅ Готово', `done:${task.id}`)
-    .text('⏰ +1 час', `snooze:${task.id}:60`)
-    .row()
-    .text('📅 Завтра', `tomorrow:${task.id}`)
-    .text('🗑 Удалить', `drop:${task.id}`);
+    .text('⏰ Отложить', `snoozemenu:${task.id}`)
+    .row();
+
+  // Задача про счётчики — сразу предлагаем внести цифры
+  if (isMeterTask(task.title)) {
+    kb.text('📟 Внести показания', `meter_input:${task.id}`).row();
+  }
+
+  kb.text('🗑 Удалить', `drop:${task.id}`).text('✏️ Изменить', `edit:${task.id}`);
 
   // У задачи из повторяющегося правила — ещё и выключатель всей серии,
   // иначе «удалить» пришлось бы жать каждую неделю
