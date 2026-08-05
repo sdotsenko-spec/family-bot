@@ -21,6 +21,11 @@ import {
   renderReport,
   renderSummary,
   renderPrompt,
+  saveOneReading,
+  extractDate,
+  renderOne,
+  metersKeyboard,
+  addPreset,
 } from './meters.js';
 import {
   parseRecurrence,
@@ -41,6 +46,8 @@ const mainKeyboard = new Keyboard()
   .row()
   .text('📆 Неделя')
   .text('🔁 Повторы')
+  .row()
+  .text('📟 Счётчики')
   .resized();
 
 const exitKeyboard = new Keyboard().text('✅ Выйти').resized();
@@ -601,6 +608,7 @@ bot.on('message:text', async (ctx) => {
     if (text === '📋 Сегодня') return showToday(ctx);
     if (text === '📆 Неделя') return showWeek(ctx);
     if (text === '🔁 Повторы') return showRecurrences(ctx);
+    if (text === '📟 Счётчики') return showMeters(ctx);
     if (text === '✅ Выйти') {
       const u = await upsertUser(ctx.from, ctx.chat);
       await clearState(u.id);
@@ -632,11 +640,31 @@ bot.on('message:text', async (ctx) => {
     }
   }
 
+  if (state?.mode === 'meter1') {
+    const { at, rest } = extractDate(text);
+    const numbers = extractNumbers(rest);
+    if (!numbers.length) {
+      await ctx.reply('Не нашёл числа. Пришлите показание цифрами.');
+      return;
+    }
+    await clearState(state.uid);
+    const result = await saveOneReading(
+      state.target_id,
+      numbers[0],
+      state.uid,
+      at ? at.toJSDate() : null
+    );
+    if (!result) return ctx.reply('Счётчик не найден');
+    await ctx.reply(renderOne(result), { parse_mode: 'HTML' });
+    return showMeters(ctx);
+  }
+
   if (state?.mode === 'meter') {
-    const numbers = extractNumbers(text);
+    const { at, rest } = extractDate(text);
+    const numbers = extractNumbers(rest);
     if (numbers.length) {
       await clearState(state.uid);
-      const result = await saveReadings(numbers, state.uid);
+      const result = await saveReadings(numbers, state.uid, at ? at.toJSDate() : null);
       await ctx.reply(renderReport(result), { parse_mode: 'HTML' });
       // Задачу «снять показания» закрываем сразу — она выполнена
       if (state.target_id) await completeTask(state.target_id, state.uid);
@@ -745,6 +773,13 @@ bot.callbackQuery(/^snoozeto:(\d+):(evening|morning|weekend)$/, async (ctx) => {
 
 // --- счётчики ---------------------------------------------------------------
 
+async function showMeters(ctx) {
+  return ctx.reply(await renderSummary(), {
+    parse_mode: 'HTML',
+    reply_markup: await metersKeyboard(),
+  });
+}
+
 bot.command('meter', async (ctx) => {
   const args = (ctx.match || '').trim().split(/\s+/).filter(Boolean);
   const sub = (args.shift() || '').toLowerCase();
@@ -758,7 +793,7 @@ bot.command('meter', async (ctx) => {
     await ctx.reply(`📟 Добавил: <b>${esc(meter.name)}</b>${meter.unit ? ` (${esc(meter.unit)})` : ''}`, {
       parse_mode: 'HTML',
     });
-    return ctx.reply(await renderSummary(), { parse_mode: 'HTML' });
+    return showMeters(ctx);
   }
 
   if (sub === 'del') {
@@ -770,15 +805,54 @@ bot.command('meter', async (ctx) => {
     });
   }
 
-  // Числа прямо в команде: /meter 1234 567
-  const numbers = extractNumbers((ctx.match || '').trim());
+  // Числа прямо в команде: /meter 1234 567 [за 29.07]
+  const { at, rest } = extractDate((ctx.match || '').trim());
+  const numbers = extractNumbers(rest);
   if (numbers.length) {
     const user = await upsertUser(ctx.from, ctx.chat);
-    const result = await saveReadings(numbers, user.id);
+    const result = await saveReadings(numbers, user.id, at ? at.toJSDate() : null);
     return ctx.reply(renderReport(result), { parse_mode: 'HTML' });
   }
 
-  return ctx.reply(await renderSummary(), { parse_mode: 'HTML' });
+  return showMeters(ctx);
+});
+
+bot.callbackQuery(/^meter_one:(\d+)$/, async (ctx) => {
+  const user = await upsertUser(ctx.from, ctx.chat);
+  // target_id здесь — id счётчика, поэтому отдельный режим
+  await setState(user.id, 'meter1', Number(ctx.match[1]), {
+    chatId: ctx.chat.id,
+    oneShot: true,
+  });
+  await ctx.answerCallbackQuery();
+  const { rows } = await q('select name, unit from meters where id=$1', [Number(ctx.match[1])]);
+  return ctx.reply(
+    `Пришлите показание: <b>${esc(rows[0]?.name || '')}</b>${rows[0]?.unit ? ` (${esc(rows[0].unit)})` : ''}\n` +
+      `<i>Снимали раньше? Допишите дату: «1250 за 29.07»</i>`,
+    { parse_mode: 'HTML' }
+  );
+});
+
+bot.callbackQuery('meter_all', async (ctx) => {
+  const user = await upsertUser(ctx.from, ctx.chat);
+  await setState(user.id, 'meter', null, { chatId: ctx.chat.id, oneShot: true });
+  await ctx.answerCallbackQuery();
+  return ctx.reply(await renderPrompt(), { parse_mode: 'HTML' });
+});
+
+bot.callbackQuery('meter_new', async (ctx) => {
+  await ctx.answerCallbackQuery();
+  return ctx.reply(
+    'Добавить счётчик:\n<code>/meter add Вода холодная м3</code>\n\n' +
+      'Последнее короткое слово — единица измерения.',
+    { parse_mode: 'HTML' }
+  );
+});
+
+bot.callbackQuery('meter_preset', async (ctx) => {
+  const added = await addPreset();
+  await ctx.answerCallbackQuery(added.length ? `Добавлено: ${added.length}` : 'Уже есть');
+  return showMeters(ctx);
 });
 
 bot.callbackQuery(/^meter_input:(\d+)$/, async (ctx) => {

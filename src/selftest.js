@@ -220,6 +220,17 @@ for (const [label, expected] of [
   check2('нет чисел', extractNumbers('нет чисел тут'), []);
   check2('«сфоткать счетчики» → задача про счётчики', isMeterTask('сфоткать счетчики'), true);
   check2('«купить хлеб» → не про счётчики', isMeterTask('купить хлеб'), false);
+
+  // Дата снятия: вырезается ДО поиска чисел, иначе «29.07» станет показанием
+  const { extractDate } = await import('./meters.js');
+  const d1 = extractDate('1250 876 5670 за 29.07', TZ, NOW);
+  check2('дата за 29.07 распознана', d1.at && d1.at.toFormat('dd.MM'), '29.07');
+  check2('дата не попала в показания', extractNumbers(d1.rest), [1250, 876, 5670]);
+  const d2 = extractDate('1250,5 29 июля', TZ, NOW);
+  check2('дата словами', d2.at && d2.at.toFormat('dd.MM'), '29.07');
+  check2('показание с запятой уцелело', extractNumbers(d2.rest), [1250.5]);
+  const d3 = extractDate('1250 876', TZ, NOW);
+  check2('без даты — null', d3.at, null);
 }
 
 console.log(failures ? `\n${failures} провалов` : '\nВсё зелёное');
