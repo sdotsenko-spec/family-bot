@@ -44,6 +44,37 @@ export async function addMeter(rawName, unit = '') {
   return rows[0];
 }
 
+/** Вернуть скрытый счётчик. Показания при удалении не стирались — они на месте. */
+export async function restoreMeter(id) {
+  const { rows } = await q(
+    `update meters set active = true where id = $1 returning *`,
+    [id]
+  );
+  return rows[0] || null;
+}
+
+/** Все счётчики, включая скрытые — чтобы найти, что вернуть. */
+export async function listAllMeters() {
+  const { rows } = await q(
+    `select * from meters order by active desc, coalesce(group_name, name), position, id`
+  );
+  return rows;
+}
+
+/** Удалить последнее показание счётчика — на случай опечатки или неверной даты. */
+export async function undoLastReading(meterId) {
+  const { rows } = await q(
+    `delete from meter_readings
+      where id = (select id from meter_readings where meter_id = $1
+                   order by taken_at desc, id desc limit 1)
+      returning value, taken_at`,
+    [meterId]
+  );
+  if (!rows.length) return null;
+  const { rows: m } = await q('select * from meters where id = $1', [meterId]);
+  return { meter: m[0], ...rows[0] };
+}
+
 export async function removeMeter(id) {
   const { rows } = await q(
     `update meters set active = false where id = $1 returning name`,

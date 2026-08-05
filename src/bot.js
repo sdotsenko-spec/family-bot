@@ -16,6 +16,10 @@ import {
   listMeters,
   addMeter,
   removeMeter,
+  restoreMeter,
+  listAllMeters,
+  undoLastReading,
+  displayName,
   extractNumbers,
   saveReadings,
   renderReport,
@@ -621,11 +625,55 @@ bot.command('meter', async (ctx) => {
 
   if (sub === 'del') {
     const id = Number(String(args.shift() || '').replace(/[#M]/gi, ''));
-    if (!id) return ctx.reply('Формат: /meter del 2');
+    if (!id) return ctx.reply('Формат: <code>/meter del 2</code>', { parse_mode: 'HTML' });
     const gone = await removeMeter(id);
-    return ctx.reply(gone ? `Убрал: ${esc(gone.name)}` : 'Не нашёл такой счётчик', {
-      parse_mode: 'HTML',
-    });
+    return ctx.reply(
+      gone
+        ? `Убрал: ${esc(gone.name)}\nПоказания сохранены — вернуть: <code>/meter restore ${id}</code>`
+        : 'Не нашёл такой счётчик',
+      { parse_mode: 'HTML' }
+    );
+  }
+
+  if (sub === 'restore') {
+    const id = Number(String(args.shift() || '').replace(/[#M]/gi, ''));
+    if (!id) return ctx.reply('Формат: <code>/meter restore 4</code>', { parse_mode: 'HTML' });
+    const back = await restoreMeter(id);
+    if (!back) return ctx.reply('Не нашёл такой счётчик');
+    await ctx.reply(`Вернул: <b>${esc(displayName(back))}</b>`, { parse_mode: 'HTML' });
+    return showMeters(ctx);
+  }
+
+  if (sub === 'undo') {
+    const id = Number(String(args.shift() || '').replace(/[#M]/gi, ''));
+    if (!id) return ctx.reply('Формат: <code>/meter undo 3</code>', { parse_mode: 'HTML' });
+    const gone = await undoLastReading(id);
+    if (!gone) return ctx.reply('У этого счётчика нет показаний');
+    const when = DateTime.fromJSDate(gone.taken_at).setZone(TZ).toFormat('dd.MM');
+    await ctx.reply(
+      `↩️ Удалил показание <b>${esc(displayName(gone.meter))}</b>: ${gone.value} (от ${when})\n` +
+        `Теперь можно внести заново с нужной датой.`,
+      { parse_mode: 'HTML' }
+    );
+    return showMeters(ctx);
+  }
+
+  if (sub === 'all') {
+    const all = await listAllMeters();
+    if (!all.length) return ctx.reply('Счётчиков нет');
+    return ctx.reply(
+      '<b>Все счётчики</b>\n\n' +
+        all
+          .map(
+            (m) =>
+              `${m.active ? '📟' : '🚫'} ${esc(displayName(m))}` +
+              `${m.unit ? ` (${esc(m.unit)})` : ''}  <code>#M${m.id}</code>` +
+              `${m.active ? '' : ' — скрыт'}`
+          )
+          .join('\n') +
+        '\n\nВернуть скрытый: <code>/meter restore ID</code>',
+      { parse_mode: 'HTML' }
+    );
   }
 
   // Числа прямо в команде: /meter 1234 567 [за 29.07]
