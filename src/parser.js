@@ -143,7 +143,9 @@ export function parseFallback(input, tz = TZ, now = DateTime.now().setZone(tz)) 
   const absoluteTimes = [];
   {
     const INTERVAL = `за\\s+(?:\\d+|пару|полчаса)?\\s*(?:полчаса|сутки|суток|день|дня|дней|час[а-яё]*|минут[а-яё]*|недел[а-яё]*)`;
-    const AT_TIME = `(?:в\\s+)?\\d{1,2}[:.]\\d{2}`;
+    // «9:10» без предлога — время. «5.08» без предлога — дата, а не 5:08,
+    // поэтому точечная форма допускается только после «в».
+    const AT_TIME = `(?:\\d{1,2}:\\d{2}|в\\s+\\d{1,2}[:.]\\d{2})`;
     const AT_HOUR = `в\\s+\\d{1,2}(?![:.\\d])(?:\\s*часов)?`;
     const COUNT = `\\d+\\s*раз[а-яё]*`;
     const SAME_DAY = `в\\s+(?:сам[а-яё]*\\s+)?(?:день|дату)\\s+событи[а-яё]*|в\\s+этот\\s+день`;
@@ -181,11 +183,11 @@ export function parseFallback(input, tz = TZ, now = DateTime.now().setZone(tz)) 
       }
 
       // б) абсолютные времена — переведём в интервалы, когда узнаем срок
-      const timeRe = /(?:в\s+)?(\d{1,2})[:.](\d{2})/giu;
+      const timeRe = /(\d{1,2}):(\d{2})|в\s+(\d{1,2})[:.](\d{2})/giu;
       let tm;
       while ((tm = timeRe.exec(clause))) {
-        const h = Number(tm[1]);
-        const mi = Number(tm[2]);
+        const h = Number(tm[1] ?? tm[3]);
+        const mi = Number(tm[2] ?? tm[4]);
         if (h <= 23 && mi <= 59) absoluteTimes.push({ h, m: mi });
       }
       // Голые часы ищем только если явных интервалов и количества нет —
@@ -214,6 +216,8 @@ export function parseFallback(input, tz = TZ, now = DateTime.now().setZone(tz)) 
   }
 
   // 3. Дата. Разбираем ДО времени, иначе «12.08» уедет в парсер часов.
+  //    dateExplicit — назвал ли пользователь дату явно.
+  let dateExplicit = false;
   let date = null;
   let hour = null;
   let minute = 0;
@@ -255,6 +259,8 @@ export function parseFallback(input, tz = TZ, now = DateTime.now().setZone(tz)) 
     } while (d.weekday !== target);
     date = d;
   }
+
+  dateExplicit = date !== null;
 
   // 4. Время
   if (hour === null) {
@@ -304,8 +310,10 @@ export function parseFallback(input, tz = TZ, now = DateTime.now().setZone(tz)) 
     }
   }
 
-  // Задача без даты, а опорный час уже прошёл → на завтра, а не в прошлое
-  if (dueAt < now) dueAt = dueAt.plus({ days: 1 });
+  // Опорный час уже прошёл → на завтра. Но только если дату не называли:
+  // «5.08 в 9:10», сказанное вечером 5-го, — это просьба на прошедший момент,
+  // а не на завтра, и молча переносить её нельзя.
+  if (dueAt < now && !dateExplicit) dueAt = dueAt.plus({ days: 1 });
 
   const title = text
     .replace(/\s+/g, ' ')

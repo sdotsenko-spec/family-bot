@@ -322,6 +322,12 @@ async function createTaskFromText(ctx, text) {
     ? rems.map((r) => humanOffset(r.label)).filter((l) => l !== 'просрочено').join(', ')
     : 'нет (срок слишком близко)';
 
+  const overdue =
+    new Date(task.due_at) < new Date()
+      ? '\n\n⚠️ Указанное время уже прошло — напоминаний не будет. ' +
+        'Поправьте кнопкой «Изменить», если ошиблись с датой.'
+      : '';
+
   const warn = looksRecurring(text)
     ? '\n\n⚠️ Похоже на повторяющуюся задачу, но правило распознать не вышло — ' +
       'поставил разовую. Попробуйте формулировку вида «каждый вторник в 20:00 …».'
@@ -333,6 +339,7 @@ async function createTaskFromText(ctx, text) {
       (assignee ? `👤 ${esc(assignee.name)}\n` : '') +
       `🔔 напомню: ${planned}\n` +
       `<code>#${task.id}</code>` +
+      overdue +
       warn,
     { parse_mode: 'HTML', reply_markup: taskKeyboard(task.id, task.recurrence_id) }
   );
