@@ -231,6 +231,16 @@ for (const [label, expected] of [
   check2('показание с запятой уцелело', extractNumbers(d2.rest), [1250.5]);
   const d3 = extractDate('1250 876', TZ, NOW);
   check2('без даты — null', d3.at, null);
+
+  // Многотарифные приборы
+  const { displayName, PRESET } = await import('./meters.js');
+  check2('имя с группой', displayName({ name: 'День', group_name: 'Электричество' }),
+    'Электричество · День');
+  check2('имя без группы', displayName({ name: 'Вода холодная', group_name: null }),
+    'Вода холодная');
+  check2('в типовом наборе есть день/ночь/общий',
+    PRESET.filter(([n]) => n.startsWith('Электричество/')).map(([n]) => n.split('/')[1]),
+    ['День', 'Ночь', 'Общий']);
 }
 
 console.log(failures ? `\n${failures} провалов` : '\nВсё зелёное');

@@ -23,6 +23,7 @@ import {
   renderPrompt,
   saveOneReading,
   extractDate,
+  checkGroup,
   renderOne,
   metersKeyboard,
   addPreset,
@@ -656,6 +657,8 @@ bot.on('message:text', async (ctx) => {
     );
     if (!result) return ctx.reply('Счётчик не найден');
     await ctx.reply(renderOne(result), { parse_mode: 'HTML' });
+    const warn = await checkGroup(result.meter.group_name);
+    if (warn) await ctx.reply(warn, { parse_mode: 'HTML' });
     return showMeters(ctx);
   }
 
@@ -666,6 +669,10 @@ bot.on('message:text', async (ctx) => {
       await clearState(state.uid);
       const result = await saveReadings(numbers, state.uid, at ? at.toJSDate() : null);
       await ctx.reply(renderReport(result), { parse_mode: 'HTML' });
+      for (const g of [...new Set(result.report.map((r) => r.meter.group_name).filter(Boolean))]) {
+        const warn = await checkGroup(g);
+        if (warn) await ctx.reply(warn, { parse_mode: 'HTML' });
+      }
       // Задачу «снять показания» закрываем сразу — она выполнена
       if (state.target_id) await completeTask(state.target_id, state.uid);
       return;
@@ -785,12 +792,19 @@ bot.command('meter', async (ctx) => {
   const sub = (args.shift() || '').toLowerCase();
 
   if (sub === 'add') {
-    if (!args.length) return ctx.reply('Формат: /meter add Вода холодная м3');
+    if (!args.length) {
+      return ctx.reply(
+        'Формат: <code>/meter add Вода холодная м3</code>\n' +
+          'Многотарифный: <code>/meter add Электричество/День кВт</code>',
+        { parse_mode: 'HTML' }
+      );
+    }
     // последнее слово — единица измерения, если она короткая и не часть названия
     let unit = '';
     if (args.length > 1 && args[args.length - 1].length <= 6) unit = args.pop();
     const meter = await addMeter(args.join(' '), unit);
-    await ctx.reply(`📟 Добавил: <b>${esc(meter.name)}</b>${meter.unit ? ` (${esc(meter.unit)})` : ''}`, {
+    const shown = meter.group_name ? `${meter.group_name} · ${meter.name}` : meter.name;
+    await ctx.reply(`📟 Добавил: <b>${esc(shown)}</b>${meter.unit ? ` (${esc(meter.unit)})` : ''}`, {
       parse_mode: 'HTML',
     });
     return showMeters(ctx);
