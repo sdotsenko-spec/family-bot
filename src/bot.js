@@ -596,9 +596,55 @@ bot.command('task', (ctx) => {
   return createTaskFromText(ctx, text);
 });
 
-bot.on('message:text', async (ctx) => {
+bot.command('meter', async (ctx) => {
+  const args = (ctx.match || '').trim().split(/\s+/).filter(Boolean);
+  const sub = (args.shift() || '').toLowerCase();
+
+  if (sub === 'add') {
+    if (!args.length) {
+      return ctx.reply(
+        'Формат: <code>/meter add Вода холодная м3</code>\n' +
+          'Многотарифный: <code>/meter add Электричество/День кВт</code>',
+        { parse_mode: 'HTML' }
+      );
+    }
+    // последнее слово — единица измерения, если она короткая и не часть названия
+    let unit = '';
+    if (args.length > 1 && args[args.length - 1].length <= 6) unit = args.pop();
+    const meter = await addMeter(args.join(' '), unit);
+    const shown = meter.group_name ? `${meter.group_name} · ${meter.name}` : meter.name;
+    await ctx.reply(`📟 Добавил: <b>${esc(shown)}</b>${meter.unit ? ` (${esc(meter.unit)})` : ''}`, {
+      parse_mode: 'HTML',
+    });
+    return showMeters(ctx);
+  }
+
+  if (sub === 'del') {
+    const id = Number(String(args.shift() || '').replace(/[#M]/gi, ''));
+    if (!id) return ctx.reply('Формат: /meter del 2');
+    const gone = await removeMeter(id);
+    return ctx.reply(gone ? `Убрал: ${esc(gone.name)}` : 'Не нашёл такой счётчик', {
+      parse_mode: 'HTML',
+    });
+  }
+
+  // Числа прямо в команде: /meter 1234 567 [за 29.07]
+  const { at, rest } = extractDate((ctx.match || '').trim());
+  const numbers = extractNumbers(rest);
+  if (numbers.length) {
+    const user = await upsertUser(ctx.from, ctx.chat);
+    const result = await saveReadings(numbers, user.id, at ? at.toJSDate() : null);
+    return ctx.reply(renderReport(result), { parse_mode: 'HTML' });
+  }
+
+  return showMeters(ctx);
+});
+
+bot.on('message:text', async (ctx, next) => {
   const text = ctx.message.text.trim();
-  if (text.startsWith('/')) return;
+  // Команды пропускаем дальше по цепочке: bot.command(), объявленные ниже
+  // этого обработчика, иначе никогда не сработают — их съест этот return.
+  if (text.startsWith('/')) return next();
 
   const isPrivate = ctx.chat.type === 'private';
   const replied = ctx.message.reply_to_message;
@@ -786,50 +832,6 @@ async function showMeters(ctx) {
     reply_markup: await metersKeyboard(),
   });
 }
-
-bot.command('meter', async (ctx) => {
-  const args = (ctx.match || '').trim().split(/\s+/).filter(Boolean);
-  const sub = (args.shift() || '').toLowerCase();
-
-  if (sub === 'add') {
-    if (!args.length) {
-      return ctx.reply(
-        'Формат: <code>/meter add Вода холодная м3</code>\n' +
-          'Многотарифный: <code>/meter add Электричество/День кВт</code>',
-        { parse_mode: 'HTML' }
-      );
-    }
-    // последнее слово — единица измерения, если она короткая и не часть названия
-    let unit = '';
-    if (args.length > 1 && args[args.length - 1].length <= 6) unit = args.pop();
-    const meter = await addMeter(args.join(' '), unit);
-    const shown = meter.group_name ? `${meter.group_name} · ${meter.name}` : meter.name;
-    await ctx.reply(`📟 Добавил: <b>${esc(shown)}</b>${meter.unit ? ` (${esc(meter.unit)})` : ''}`, {
-      parse_mode: 'HTML',
-    });
-    return showMeters(ctx);
-  }
-
-  if (sub === 'del') {
-    const id = Number(String(args.shift() || '').replace(/[#M]/gi, ''));
-    if (!id) return ctx.reply('Формат: /meter del 2');
-    const gone = await removeMeter(id);
-    return ctx.reply(gone ? `Убрал: ${esc(gone.name)}` : 'Не нашёл такой счётчик', {
-      parse_mode: 'HTML',
-    });
-  }
-
-  // Числа прямо в команде: /meter 1234 567 [за 29.07]
-  const { at, rest } = extractDate((ctx.match || '').trim());
-  const numbers = extractNumbers(rest);
-  if (numbers.length) {
-    const user = await upsertUser(ctx.from, ctx.chat);
-    const result = await saveReadings(numbers, user.id, at ? at.toJSDate() : null);
-    return ctx.reply(renderReport(result), { parse_mode: 'HTML' });
-  }
-
-  return showMeters(ctx);
-});
 
 bot.callbackQuery(/^meter_one:(\d+)$/, async (ctx) => {
   const user = await upsertUser(ctx.from, ctx.chat);
