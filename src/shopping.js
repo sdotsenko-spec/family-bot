@@ -73,6 +73,11 @@ export async function toggleItem(id, userId) {
   return rows[0] || null;
 }
 
+export async function deleteItem(id) {
+  const { rows } = await q('delete from shopping_items where id = $1 returning title', [id]);
+  return rows[0] || null;
+}
+
 export async function clearChecked() {
   const { rowCount } = await q('delete from shopping_items where checked = true');
   return rowCount;
@@ -86,15 +91,19 @@ export async function listItems() {
 }
 
 /** Сообщение со списком: текст + инлайн-кнопки-галочки. */
-export async function renderList() {
+export async function renderList(editMode = false) {
   const items = await listItems();
   const open = items.filter((i) => !i.checked);
   const done = items.filter((i) => i.checked);
 
   const kb = new InlineKeyboard();
 
+  // В режиме правки та же кнопка удаляет пункт, а не отмечает его
+  const action = (item) => (editMode ? `buy_del:${item.id}` : `buy_tog:${item.id}`);
+  const mark = (item) => (editMode ? '🗑' : item.checked ? '✅' : '☐');
+
   for (const item of open.slice(0, MAX_SHOWN)) {
-    kb.text(`☐ ${item.title}`, `buy_tog:${item.id}`).row();
+    kb.text(`${mark(item)} ${item.title}`, action(item)).row();
   }
 
   // Купленное уезжает в «корзину» под разделитель, но остаётся кнопкой —
@@ -102,15 +111,21 @@ export async function renderList() {
   if (done.length) {
     kb.text(`— 🧺 Корзина (${done.length}) —`, 'noop').row();
     for (const item of done.slice(0, MAX_SHOWN)) {
-      kb.text(`✅ ${item.title}`, `buy_tog:${item.id}`).row();
+      kb.text(`${mark(item)} ${item.title}`, action(item)).row();
     }
   }
 
-  kb.text('➕ Добавить', 'buy_add');
-  if (done.length) kb.text('🧹 Очистить корзину', 'buy_clear');
+  if (editMode) {
+    kb.text('← Готово', 'buy_edit_off');
+  } else {
+    kb.text('➕ Добавить', 'buy_add');
+    if (items.length) kb.text('✏️ Править', 'buy_edit_on');
+    if (done.length) kb.row().text('🧹 Очистить корзину', 'buy_clear');
+  }
 
+  const head = editMode ? '🛒 <b>Правка списка</b>\nНажмите пункт, чтобы удалить' : null;
   const text = items.length
-    ? `🛒 <b>Список покупок</b>\nНужно купить: ${open.length}` +
+    ? (head || `🛒 <b>Список покупок</b>\nНужно купить: ${open.length}`) +
       (done.length ? ` · в корзине: ${done.length}` : '') +
       (items.length > MAX_SHOWN ? `\n<i>показаны первые ${MAX_SHOWN}</i>` : '')
     : `🛒 <b>Список покупок</b>\nПусто. Нажмите «Добавить» или напишите <code>/buy молоко, хлеб</code>`;
@@ -119,8 +134,8 @@ export async function renderList() {
 }
 
 /** Обновляет сообщение со списком на месте; если не вышло — не страшно. */
-export async function refreshMessage(ctx) {
-  const { text, keyboard } = await renderList();
+export async function refreshMessage(ctx, editMode = false) {
+  const { text, keyboard } = await renderList(editMode);
   try {
     await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: keyboard });
   } catch (e) {

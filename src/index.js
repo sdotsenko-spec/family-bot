@@ -5,6 +5,7 @@ import { bot, maybeSendDigest } from './bot.js';
 import { dispatchDueReminders } from './reminders.js';
 import { syncAllCalendars } from './calendar/ics.js';
 import { materializeAll } from './recurrence.js';
+import { buildFeed, feedToken } from './feed.js';
 
 const REMINDER_TICK_MS = 60_000;
 const CAL_TICK_MS = Number(process.env.CAL_SYNC_MIN || 15) * 60_000;
@@ -50,8 +51,31 @@ async function main() {
 
   // Railway любит открытый порт
   const port = process.env.PORT || 3000;
+  const token = await feedToken();
+
   http
-    .createServer((req, res) => {
+    .createServer(async (req, res) => {
+      // Подписной календарь: /cal/<секрет>.ics
+      const match = /^\/cal\/([a-f0-9]{32})\.ics$/.exec((req.url || '').split('?')[0]);
+      if (match) {
+        if (match[1] !== token) {
+          res.writeHead(404).end('not found');
+          return;
+        }
+        try {
+          const body = await buildFeed();
+          res.writeHead(200, {
+            'content-type': 'text/calendar; charset=utf-8',
+            'cache-control': 'public, max-age=600',
+          });
+          res.end(body);
+        } catch (e) {
+          console.error('[feed] ошибка сборки:', e.message);
+          res.writeHead(500).end('error');
+        }
+        return;
+      }
+
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ ok: true, ts: new Date().toISOString() }));
     })

@@ -9,8 +9,17 @@ import {
 } from './reminders.js';
 import { DateTime, TZ, fmt, humanOffset } from './time.js';
 import { syncAllCalendars } from './calendar/ics.js';
-import { addItems, toggleItem, clearChecked, renderList, refreshMessage, looksLikeTask } from './shopping.js';
+import {
+  addItems,
+  toggleItem,
+  deleteItem,
+  clearChecked,
+  renderList,
+  refreshMessage,
+  looksLikeTask,
+} from './shopping.js';
 import { parseFallback } from './parser.js';
+import { feedToken, publicUrl } from './feed.js';
 import {
   isMeterTask,
   listMeters,
@@ -169,6 +178,7 @@ bot.command('help', (ctx) =>
       `/today — что сегодня\n/week — на неделю\n/list — все открытые\n` +
       `/done ID — закрыть\n/del ID — удалить\n/edit ID текст — изменить\n` +
       `/buy — список покупок\n/meter — счётчики и показания\n` +
+      `/calfeed — подписка на календарь\n` +
       `/recur — повторяющиеся задачи\n` +
       `/cal add URL — подключить календарь (ссылка .ics)\n` +
       `/cal list, /cal del ID\n/sync — синхронизировать календари сейчас\n` +
@@ -204,6 +214,28 @@ bot.command('parse', async (ctx) => {
       (viaLlm ? `<b>Регулярки для сравнения</b>\n      ${show(regex)}\n\n` : '') +
       `<i>таймзона ${TZ}</i>`,
     { parse_mode: 'HTML' }
+  );
+});
+
+bot.command('calfeed', async (ctx) => {
+  const base = publicUrl();
+  if (!base) {
+    return ctx.reply(
+      'У сервиса нет публичного адреса. В Railway: Settings → Networking → Generate Domain, ' +
+        'после этого команда заработает.'
+    );
+  }
+  const token = await feedToken();
+  const url = `${base}/cal/${token}.ics`;
+  return ctx.reply(
+    `📆 <b>Подписка на календарь</b>\n\n<code>${url}</code>\n\n` +
+      `<b>Google:</b> calendar.google.com → Другие календари → Подписаться по URL\n` +
+      `<b>iPhone:</b> Настройки → Календарь → Учётные записи → Добавить → Другое → ` +
+      `Подписной календарь\n\n` +
+      `Задачи и повторы попадут в календарь автоматически. ` +
+      `Google обновляет подписки раз в несколько часов, Apple — чаще.\n` +
+      `<i>Ссылка не защищена паролем — не показывайте посторонним.</i>`,
+    { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
   );
 });
 
@@ -515,6 +547,22 @@ bot.callbackQuery(/^buy_tog:(\d+)$/, async (ctx) => {
 
 // Разделитель «Корзина» — кнопка только для вида
 bot.callbackQuery('noop', (ctx) => ctx.answerCallbackQuery());
+
+bot.callbackQuery('buy_edit_on', async (ctx) => {
+  await ctx.answerCallbackQuery();
+  await refreshMessage(ctx, true);
+});
+
+bot.callbackQuery('buy_edit_off', async (ctx) => {
+  await ctx.answerCallbackQuery();
+  await refreshMessage(ctx, false);
+});
+
+bot.callbackQuery(/^buy_del:(\d+)$/, async (ctx) => {
+  const gone = await deleteItem(Number(ctx.match[1]));
+  await ctx.answerCallbackQuery(gone ? `Удалил: ${gone.title}` : 'Уже нет');
+  await refreshMessage(ctx, true); // остаёмся в правке — обычно удаляют несколько подряд
+});
 
 bot.callbackQuery('buy_clear', async (ctx) => {
   try {

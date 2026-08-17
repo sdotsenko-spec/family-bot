@@ -3,7 +3,12 @@ import { q, withTx, getSetting } from './db.js';
 import { offsetToMs, humanOffset, fmt, TZ } from './time.js';
 import { isMeterTask } from './meters.js';
 
-export const DEFAULT_OFFSETS = ['24h', '3h', '30m'];
+// Набор напоминаний по умолчанию — когда пользователь не указал свой.
+// Меняется переменной окружения без правки кода: DEFAULT_OFFSETS=1d,2h,15m
+export const DEFAULT_OFFSETS = (process.env.DEFAULT_OFFSETS || '24h,3h,30m')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
 
 // Если бот лежал и напоминание протухло больше чем на GRACE_MS — не отправляем,
 // помечаем skipped. Иначе после каждого деплоя семья получает пачку мусора.
