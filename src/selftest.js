@@ -106,6 +106,14 @@ for (const [label, expected] of [
     chats(chooseTargets({ reminder: { label: '3h', task_id: 1 }, task: { ...base, dm_chat_id: null }, assignee: wife, familyChatId: GROUP })),
     [GROUP]);
 
+  check('личная задача — только в свою личку, без пинга и эскалации',
+    chats(chooseTargets({ reminder: { label: '3h', task_id: 1 }, task: { ...base, is_private: true, chat_id: DM }, assignee: wife, familyChatId: GROUP })),
+    [DM]);
+
+  check('личная задача: эскалация тоже не в группу',
+    chats(chooseTargets({ reminder: { label: 'escalation', task_id: 1 }, task: { ...base, is_private: true, chat_id: DM }, assignee: wife, familyChatId: GROUP })),
+    [DM]);
+
   check('эскалация — только в общий чат',
     chats(chooseTargets({ reminder: { label: 'escalation', task_id: 1 }, task: base, assignee: wife, familyChatId: GROUP })),
     [GROUP]);

@@ -190,6 +190,12 @@ export function chooseTargets({ reminder, task, assignee, familyChatId, familyTh
   const groupThread = task.thread_id || familyThread || undefined;
   const body = renderText(reminder, task, assignee);
 
+  // Личная задача (создана в личке) не выходит наружу ни при каких условиях:
+  // ни пингом в группу, ни эскалацией
+  if (task.is_private) {
+    return [{ chat: task.chat_id || dmChatId, text: body, keyboard: true }];
+  }
+
   // Эскалация принципиально публичная — смысл в том, чтобы увидели все
   if (isEscalation) {
     return [{ chat: groupChatId || task.chat_id, thread: groupThread, text: body, keyboard: true }];

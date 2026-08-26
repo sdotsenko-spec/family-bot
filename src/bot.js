@@ -364,8 +364,9 @@ async function createTaskFromText(ctx, text) {
   const task = await withTx(async (c) => {
     const { rows } = await c.query(
       `insert into tasks
-         (title, due_at, is_all_day, tz, assignee_id, creator_id, chat_id, thread_id, offsets)
-       values ($1,$2,$3,$4,$5,$6,$7,$8,$9) returning *`,
+         (title, due_at, is_all_day, tz, assignee_id, creator_id, chat_id, thread_id, offsets,
+          is_private)
+       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) returning *`,
       [
         parsed.title,
         parsed.dueAt,
@@ -376,6 +377,7 @@ async function createTaskFromText(ctx, text) {
         ctx.chat.id,
         ctx.message?.message_thread_id || null,
         JSON.stringify(offsets),
+        ctx.chat.type === 'private',
       ]
     );
     await regenerateReminders(rows[0], c);
@@ -403,7 +405,7 @@ async function createTaskFromText(ctx, text) {
     : '';
 
   await ctx.reply(
-    `📌 <b>${esc(task.title)}</b>\n` +
+    `📌 <b>${esc(task.title)}</b>${task.is_private ? ' 🔒' : ''}\n` +
       `🗓 ${fmt(new Date(task.due_at), TZ, task.is_all_day)}\n` +
       (assignee ? `👤 ${esc(assignee.name)}\n` : '') +
       `🔔 напомню: ${planned}\n` +
@@ -429,8 +431,9 @@ async function createRecurrenceFromText(ctx, original, found) {
 
   const { rows } = await q(
     `insert into recurrences
-       (title, rrule, dtstart, tz, is_all_day, assignee_id, creator_id, chat_id, thread_id, offsets)
-     values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) returning *`,
+       (title, rrule, dtstart, tz, is_all_day, assignee_id, creator_id, chat_id, thread_id, offsets,
+        is_private)
+     values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) returning *`,
     [
       parsed.title,
       found.rrule,
@@ -442,6 +445,7 @@ async function createRecurrenceFromText(ctx, original, found) {
       ctx.chat.id,
       ctx.message?.message_thread_id || null,
       JSON.stringify(offsets),
+      ctx.chat.type === 'private',
     ]
   );
   const rec = rows[0];
@@ -1038,21 +1042,58 @@ export async function maybeSendDigest() {
   const chatId = process.env.FAMILY_CHAT_ID || (await getSetting('family_chat_id'));
   if (!chatId) return;
 
+  const from = now.startOf('day').toJSDate();
+  const to = now.endOf('day').toJSDate();
+
+  // Общий дайджест — только семейные задачи. Личные, созданные в личке,
+  // в общий чат не выкладываем.
   const { rows } = await q(
     `select t.*, u.name as assignee_name
        from tasks t left join users u on u.id = t.assignee_id
-      where t.status='pending' and t.due_at >= $1 and t.due_at < $2
+      where t.status='pending' and t.is_private = false
+        and t.due_at >= $1 and t.due_at < $2
       order by t.due_at`,
-    [now.startOf('day').toJSDate(), now.endOf('day').toJSDate()]
+    [from, to]
   );
 
   await setSetting('last_digest_date', today);
-  if (!rows.length) return;
 
   const threadId = await getSetting('family_thread_id');
-  await bot.api.sendMessage(
-    chatId,
-    `☀️ <b>План на сегодня</b>\n\n` + rows.map(taskLine).join('\n\n'),
-    { parse_mode: 'HTML', message_thread_id: threadId || undefined }
+  if (rows.length) {
+    await bot.api.sendMessage(
+      chatId,
+      `☀️ <b>План на сегодня</b>\n\n` + rows.map(taskLine).join('\n\n'),
+      { parse_mode: 'HTML', message_thread_id: threadId || undefined }
+    );
+  }
+
+  // Личный дайджест — каждому в личку, только его собственные задачи
+  const { rows: personal } = await q(
+    `select t.*, u.dm_chat_id, u.name as assignee_name
+       from tasks t join users u on u.id = t.creator_id
+      where t.status='pending' and t.is_private = true
+        and u.dm_chat_id is not null
+        and t.due_at >= $1 and t.due_at < $2
+      order by u.dm_chat_id, t.due_at`,
+    [from, to]
   );
+
+  const byUser = new Map();
+  for (const task of personal) {
+    if (!byUser.has(task.dm_chat_id)) byUser.set(task.dm_chat_id, []);
+    byUser.get(task.dm_chat_id).push(task);
+  }
+
+  for (const [dmChatId, tasks] of byUser) {
+    try {
+      await bot.api.sendMessage(
+        dmChatId,
+        `☀️ <b>Ваши задачи на сегодня</b>\n\n` + tasks.map(taskLine).join('\n\n'),
+        { parse_mode: 'HTML' }
+      );
+      await new Promise((r) => setTimeout(r, 120));
+    } catch (e) {
+      console.warn('[digest] личный дайджест не ушёл:', e.message);
+    }
+  }
 }
