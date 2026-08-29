@@ -21,6 +21,15 @@ import {
 import { parseFallback } from './parser.js';
 import { feedToken, publicUrl } from './feed.js';
 import {
+  computeBill,
+  renderBill,
+  saveBill,
+  listCharges,
+  updateRate,
+  deactivateCharge,
+  setupFromInvoices,
+} from './billing.js';
+import {
   isMeterTask,
   listMeters,
   addMeter,
@@ -178,7 +187,7 @@ bot.command('help', (ctx) =>
       `/today — что сегодня\n/week — на неделю\n/list — все открытые\n` +
       `/done ID — закрыть\n/del ID — удалить\n/edit ID текст — изменить\n` +
       `/buy — список покупок\n/meter — счётчики и показания\n` +
-      `/calfeed — подписка на календарь\n` +
+      `/calfeed — подписка на календарь\n/bill — расчёт коммуналки\n` +
       `/recur — повторяющиеся задачи\n` +
       `/cal add URL — подключить календарь (ссылка .ics)\n` +
       `/cal list, /cal del ID\n/sync — синхронизировать календари сейчас\n` +
@@ -738,6 +747,70 @@ bot.command('meter', async (ctx) => {
   }
 
   return showMeters(ctx);
+});
+
+bot.command('bill', async (ctx) => {
+  const args = (ctx.match || '').trim().split(/\s+/).filter(Boolean);
+  const sub = (args.shift() || '').toLowerCase();
+
+  if (sub === 'setup') {
+    const { created, skipped } = await setupFromInvoices();
+    let msg = created.length
+      ? `Завёл начислений: ${created.length}`
+      : 'Всё уже заведено — ничего не менял';
+    if (skipped.length) msg += `\n\n⚠️ Пропущено:\n• ${skipped.map(esc).join('\n• ')}`;
+    await ctx.reply(msg, { parse_mode: 'HTML' });
+    return ctx.reply(await listCharges(), { parse_mode: 'HTML' });
+  }
+
+  if (sub === 'list' || sub === 'tariffs') {
+    return ctx.reply(await listCharges(), { parse_mode: 'HTML' });
+  }
+
+  if (sub === 'save') {
+    const bill = await computeBill();
+    const saved = await saveBill(bill);
+    return ctx.reply(
+      saved ? 'Счёт сохранён — следующий буду сравнивать с ним.' : 'Нечего сохранять',
+      { parse_mode: 'HTML' }
+    );
+  }
+
+  const bill = await computeBill();
+  return ctx.reply(await renderBill(bill), { parse_mode: 'HTML' });
+});
+
+bot.command('tariff', async (ctx) => {
+  const args = (ctx.match || '').trim().split(/\s+/).filter(Boolean);
+
+  if (!args.length) return ctx.reply(await listCharges(), { parse_mode: 'HTML' });
+
+  if (args[0].toLowerCase() === 'del') {
+    const id = Number(String(args[1] || '').replace(/[#C]/gi, ''));
+    const gone = id ? await deactivateCharge(id) : null;
+    return ctx.reply(gone ? `Убрал: ${esc(gone.name)}` : 'Формат: /tariff del #C3', {
+      parse_mode: 'HTML',
+    });
+  }
+
+  const id = Number(String(args[0]).replace(/[#C]/gi, ''));
+  const rate = Number(String(args[1] || '').replace(',', '.'));
+  const from = args[2];
+  if (!id || !Number.isFinite(rate)) {
+    return ctx.reply(
+      'Формат: <code>/tariff #C3 31.5</code> — новая цена с сегодняшнего дня\n' +
+        'Или с даты: <code>/tariff #C3 31.5 2026-09-01</code>',
+      { parse_mode: 'HTML' }
+    );
+  }
+
+  const created = await updateRate(id, rate, from);
+  if (!created) return ctx.reply('Не нашёл такое начисление');
+  return ctx.reply(
+    `Новая цена для <b>${esc(created.name)}</b>: ${rate} с ${created.valid_from.toISOString().slice(0, 10)}\n` +
+      `<i>Старая осталась в истории — прошлые периоды не пересчитаются.</i>`,
+    { parse_mode: 'HTML' }
+  );
 });
 
 bot.on('message:text', async (ctx, next) => {
