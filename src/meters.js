@@ -239,7 +239,7 @@ export async function saveReadings(values, userId, takenAt = null) {
   const rejected = [];
   for (let i = 0; i < Math.min(values.length, meters.length); i++) {
     if (isImplausible(values[i])) {
-      rejected.push(`${displayName(meters[i])}: ${values[i]}`);
+      rejected.push(`${displayName(meters[i])}: ${values[i]} — ноль или отрицательное`);
       continue;
     }
     const meter = meters[i];
@@ -425,12 +425,27 @@ export async function renderPrompt() {
 }
 
 /** Сохраняет показание одного счётчика (кнопочный путь). */
-export async function saveOneReading(meterId, value, userId, takenAt = null) {
+/**
+ * Значение меньше предыдущего — почти всегда ошибка: счётчик назад не идёт.
+ * Настоящие исключения (замена прибора, переход через разрядность) редки,
+ * поэтому не запрещаем совсем, а требуем подтверждения через force.
+ */
+export async function saveOneReading(meterId, value, userId, takenAt = null, force = false) {
   const { rows } = await q('select * from meters where id = $1', [meterId]);
   const meter = rows[0];
   if (!meter) return null;
 
   const prev = await readingBefore(meter.id, takenAt);
+
+  if (!force && prev && Number(value) < Number(prev.value)) {
+    return {
+      rejected: true,
+      meter,
+      value,
+      prevValue: Number(prev.value),
+      prevAt: prev.taken_at,
+    };
+  }
 
   // Показание на ту же дату — исправление, а не новый замер
   const same = await sameDayReading(meter.id, takenAt);

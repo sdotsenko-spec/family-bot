@@ -93,6 +93,12 @@ export async function computeBill() {
       missing.push(c.name);
       continue;
     }
+    // Отрицательный расход — испорченные показания. Считать по ним нельзя:
+    // получится счёт с минусом, который выглядит как правдоподобный ответ.
+    if (d.delta < 0) {
+      missing.push(`${c.name} — расход отрицательный, проверьте показания`);
+      continue;
+    }
     const amount = d.delta * Number(c.rate);
     group.lines.push({
       name: c.name,

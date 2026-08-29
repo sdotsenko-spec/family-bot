@@ -709,6 +709,20 @@ bot.command('meter', async (ctx) => {
     return showMeters(ctx);
   }
 
+  if (sub === 'force') {
+    const id = Number(String(args.shift() || '').replace(/[#M]/gi, ''));
+    const value = Number(String(args.shift() || '').replace(',', '.'));
+    if (!id || !Number.isFinite(value)) {
+      return ctx.reply('Формат: <code>/meter force 2 16.5</code>', { parse_mode: 'HTML' });
+    }
+    const user = await upsertUser(ctx.from, ctx.chat);
+    const { at } = extractDate((ctx.match || '').trim());
+    const result = await saveOneReading(id, value, user.id, at ? at.toJSDate() : null, true);
+    if (!result) return ctx.reply('Счётчик не найден');
+    await ctx.reply(renderOne(result), { parse_mode: 'HTML' });
+    return showMeters(ctx);
+  }
+
   if (sub === 'log') {
     const id = Number(String(args.shift() || '').replace(/[#M]/gi, ''));
     if (!id) return ctx.reply('Формат: <code>/meter log 4</code>', { parse_mode: 'HTML' });
@@ -902,6 +916,18 @@ bot.on('message:text', async (ctx, next) => {
       at ? at.toJSDate() : null
     );
     if (!result) return ctx.reply('Счётчик не найден');
+
+    if (result.rejected) {
+      const when = DateTime.fromJSDate(result.prevAt).setZone(TZ).toFormat('dd.MM');
+      return ctx.reply(
+        `⚠️ Не принял: <b>${esc(numbers[0])}</b> меньше прежнего ` +
+          `<b>${esc(result.prevValue)}</b> (от ${when}).\n\n` +
+          `Счётчик назад не идёт. Проверьте, не внесли ли вы расход за месяц ` +
+          `вместо показания на табло.\n\n` +
+          `Если прибор действительно меняли: <code>/meter force ${state.target_id} ${numbers[0]}</code>`,
+        { parse_mode: 'HTML' }
+      );
+    }
     await ctx.reply(renderOne(result), { parse_mode: 'HTML' });
     const warn = await checkGroup(result.meter.group_name);
     if (warn) await ctx.reply(warn, { parse_mode: 'HTML' });
