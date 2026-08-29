@@ -37,6 +37,10 @@ import {
   restoreMeter,
   listAllMeters,
   undoLastReading,
+  readingsLog,
+  removeReading,
+  isImplausible,
+  renderLog,
   displayName,
   extractNumbers,
   saveReadings,
@@ -705,6 +709,22 @@ bot.command('meter', async (ctx) => {
     return showMeters(ctx);
   }
 
+  if (sub === 'log') {
+    const id = Number(String(args.shift() || '').replace(/[#M]/gi, ''));
+    if (!id) return ctx.reply('Формат: <code>/meter log 4</code>', { parse_mode: 'HTML' });
+    return ctx.reply(await renderLog(id), { parse_mode: 'HTML' });
+  }
+
+  if (sub === 'rm') {
+    const id = Number(String(args.shift() || '').replace(/[#R]/gi, ''));
+    if (!id) return ctx.reply('Формат: <code>/meter rm R12</code>', { parse_mode: 'HTML' });
+    const gone = await removeReading(id);
+    if (!gone) return ctx.reply('Не нашёл такое показание');
+    const when = DateTime.fromJSDate(gone.taken_at).setZone(TZ).toFormat('dd.MM.yyyy');
+    await ctx.reply(`↩️ Удалил показание ${gone.value} от ${when}`, { parse_mode: 'HTML' });
+    return ctx.reply(await renderLog(gone.meter_id), { parse_mode: 'HTML' });
+  }
+
   if (sub === 'undo') {
     const id = Number(String(args.shift() || '').replace(/[#M]/gi, ''));
     if (!id) return ctx.reply('Формат: <code>/meter undo 3</code>', { parse_mode: 'HTML' });
@@ -865,6 +885,13 @@ bot.on('message:text', async (ctx, next) => {
     const numbers = extractNumbers(rest);
     if (!numbers.length) {
       await ctx.reply('Не нашёл числа. Пришлите показание цифрами.');
+      return;
+    }
+    if (isImplausible(numbers[0])) {
+      await ctx.reply(
+        `⚠️ Показание ${numbers[0]} принять не могу — ноль на счётчике невозможен. ` +
+          `Проверьте цифры и пришлите ещё раз.`
+      );
       return;
     }
     await clearState(state.uid);

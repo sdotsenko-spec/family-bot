@@ -75,6 +75,49 @@ export async function undoLastReading(meterId) {
   return { meter: m[0], ...rows[0] };
 }
 
+/** История показаний счётчика — чтобы найти и убрать ошибочное. */
+export async function readingsLog(meterId, limit = 12) {
+  const { rows } = await q(
+    `select r.id, r.value, r.taken_at
+       from meter_readings r
+      where r.meter_id = $1
+      order by r.taken_at desc, r.id desc
+      limit $2`,
+    [meterId, limit]
+  );
+  return rows;
+}
+
+/** Удалить конкретное показание по его id — undo снимает только последнее. */
+export async function removeReading(readingId) {
+  const { rows } = await q(
+    `delete from meter_readings where id = $1 returning meter_id, value, taken_at`,
+    [readingId]
+  );
+  return rows[0] || null;
+}
+
+export async function renderLog(meterId) {
+  const { rows: m } = await q('select * from meters where id = $1', [meterId]);
+  if (!m.length) return 'Счётчик не найден';
+  const log = await readingsLog(meterId);
+  if (!log.length) return `<b>${esc(displayName(m[0]))}</b> — показаний нет`;
+
+  const unit = m[0].unit ? ` ${esc(m[0].unit)}` : '';
+  const lines = log.map((r, i) => {
+    const when = DateTime.fromJSDate(r.taken_at).setZone(TZ).toFormat('dd.MM.yyyy');
+    const next = log[i + 1];
+    const delta = next ? ` <i>(+${fmtNum(Number(r.value) - Number(next.value))})</i>` : '';
+    return `${when}: ${fmtNum(r.value)}${unit}${delta}  <code>#R${r.id}</code>`;
+  });
+
+  return (
+    `<b>${esc(displayName(m[0]))}</b>\n\n` +
+    lines.join('\n') +
+    '\n\n<i>Удалить ошибочное: /meter rm R12</i>'
+  );
+}
+
 export async function removeMeter(id) {
   const { rows } = await q(
     `update meters set active = false where id = $1 returning name`,
@@ -141,10 +184,47 @@ export function extractNumbers(text) {
 async function lastTwo(meterId) {
   const { rows } = await q(
     `select value, taken_at from meter_readings
-      where meter_id = $1 order by taken_at desc limit 2`,
+      where meter_id = $1 order by taken_at desc, id desc limit 2`,
     [meterId]
   );
   return rows;
+}
+
+/**
+ * Показание, предшествующее указанной дате.
+ * Именно с ним надо сравнивать, а не с самым свежим: при вводе задним числом
+ * «самое свежее» окажется позже нового, и расход с интервалом уедут в минус.
+ */
+async function readingBefore(meterId, at) {
+  const { rows } = await q(
+    `select value, taken_at from meter_readings
+      where meter_id = $1 and taken_at < coalesce($2::timestamptz, now())
+      order by taken_at desc, id desc limit 1`,
+    [meterId, at]
+  );
+  return rows[0] || null;
+}
+
+/**
+ * Запись за тот же календарный день, если она уже есть.
+ * Сравниваем по дню, а не по времени: показания вносят то днём, то вечером,
+ * и «то же самое, только поправил» должно считаться исправлением.
+ */
+async function sameDayReading(meterId, at, tz = TZ) {
+  const day = (at ? DateTime.fromJSDate(at) : DateTime.now()).setZone(tz).toISODate();
+  const { rows } = await q(
+    `select id, value, taken_at from meter_readings
+      where meter_id = $1
+        and (taken_at at time zone 'UTC' at time zone $3)::date = $2::date
+      order by id desc limit 1`,
+    [meterId, day, tz]
+  );
+  return rows[0] || null;
+}
+
+/** Ноль и отрицательные значения счётчик показать не может. */
+export function isImplausible(value) {
+  return !Number.isFinite(value) || value <= 0;
 }
 
 /**
@@ -156,16 +236,33 @@ export async function saveReadings(values, userId, takenAt = null) {
   const meters = await listMeters();
   const report = [];
 
+  const rejected = [];
   for (let i = 0; i < Math.min(values.length, meters.length); i++) {
+    if (isImplausible(values[i])) {
+      rejected.push(`${displayName(meters[i])}: ${values[i]}`);
+      continue;
+    }
     const meter = meters[i];
     const value = values[i];
-    const prev = (await lastTwo(meter.id))[0];
+    const prev = await readingBefore(meter.id, takenAt);
 
-    await q(
-      `insert into meter_readings (meter_id, value, added_by, taken_at)
-       values ($1,$2,$3::int, coalesce($4::timestamptz, now()))`,
-      [meter.id, value, userId || null, takenAt]
-    );
+    const same = await sameDayReading(meter.id, takenAt);
+    let replaced = null;
+    if (same) {
+      replaced = Number(same.value);
+      await q(
+        `update meter_readings set value = $2, added_by = $3::int,
+                taken_at = coalesce($4::timestamptz, taken_at)
+          where id = $1`,
+        [same.id, value, userId || null, takenAt]
+      );
+    } else {
+      await q(
+        `insert into meter_readings (meter_id, value, added_by, taken_at)
+         values ($1,$2,$3::int, coalesce($4::timestamptz, now()))`,
+        [meter.id, value, userId || null, takenAt]
+      );
+    }
 
     let delta = null;
     let days = null;
@@ -174,10 +271,10 @@ export async function saveReadings(values, userId, takenAt = null) {
       const from = takenAt ? DateTime.fromJSDate(takenAt) : DateTime.now();
       days = Math.max(1, Math.round(from.diff(DateTime.fromJSDate(prev.taken_at), 'days').days));
     }
-    report.push({ meter, value, delta, days, takenAt });
+    report.push({ meter, value, delta, days, takenAt, replaced });
   }
 
-  return { report, extra: values.length - meters.length };
+  return { report, extra: values.length - meters.length, rejected };
 }
 
 const fmtNum = (n) =>
@@ -186,10 +283,12 @@ const fmtNum = (n) =>
     .replace(/\.?0+$/, '')
     .replace('.', ',');
 
-export function renderReport({ report, extra }) {
+export function renderReport({ report, extra, rejected = [] }) {
+  if (!report.length && rejected.length)
+    return `⚠️ Не принял: ${rejected.map(esc).join(', ')}\nНоль на счётчике невозможен — проверьте цифры.`;
   if (!report.length) return 'Не нашёл чисел в сообщении.';
 
-  const lines = report.map(({ meter, value, delta, days, takenAt }) => {
+  const lines = report.map(({ meter, value, delta, days, takenAt, replaced }) => {
     const unit = meter.unit ? ` ${esc(meter.unit)}` : '';
     let tail = '';
     if (delta === null) tail = ' <i>(первое показание)</i>';
@@ -198,9 +297,15 @@ export function renderReport({ report, extra }) {
     const dated = takenAt
       ? ` <i>(на ${DateTime.fromJSDate(takenAt).setZone(TZ).toFormat('dd.MM')})</i>`
       : '';
-    return `📟 <b>${esc(displayName(meter))}</b>: ${fmtNum(value)}${unit}${dated}${tail}`;
+    const fixed =
+      replaced != null && replaced !== Number(value)
+        ? ` <i>(заменил ${fmtNum(replaced)})</i>`
+        : '';
+    return `📟 <b>${esc(displayName(meter))}</b>: ${fmtNum(value)}${unit}${dated}${tail}${fixed}`;
   });
 
+  if (rejected.length)
+    lines.push(`⚠️ <i>Не принял (ноль или отрицательное): ${rejected.map(esc).join(', ')}</i>`);
   if (extra > 0) lines.push(`<i>Лишних чисел: ${extra} — счётчиков меньше</i>`);
   if (extra < 0) lines.push(`<i>Не хватило чисел для ${-extra} счётчиков</i>`);
 
@@ -325,12 +430,26 @@ export async function saveOneReading(meterId, value, userId, takenAt = null) {
   const meter = rows[0];
   if (!meter) return null;
 
-  const prev = (await lastTwo(meter.id))[0];
-  await q(
-    `insert into meter_readings (meter_id, value, added_by, taken_at)
-     values ($1,$2,$3::int, coalesce($4::timestamptz, now()))`,
-    [meter.id, value, userId || null, takenAt]
-  );
+  const prev = await readingBefore(meter.id, takenAt);
+
+  // Показание на ту же дату — исправление, а не новый замер
+  const same = await sameDayReading(meter.id, takenAt);
+  let replaced = null;
+  if (same) {
+    replaced = Number(same.value);
+    await q(
+      `update meter_readings set value = $2, added_by = $3::int,
+              taken_at = coalesce($4::timestamptz, taken_at)
+        where id = $1`,
+      [same.id, value, userId || null, takenAt]
+    );
+  } else {
+    await q(
+      `insert into meter_readings (meter_id, value, added_by, taken_at)
+       values ($1,$2,$3::int, coalesce($4::timestamptz, now()))`,
+      [meter.id, value, userId || null, takenAt]
+    );
+  }
 
   let delta = null;
   let days = null;
@@ -339,14 +458,14 @@ export async function saveOneReading(meterId, value, userId, takenAt = null) {
     const from = takenAt ? DateTime.fromJSDate(takenAt) : DateTime.now();
     days = Math.max(1, Math.round(from.diff(DateTime.fromJSDate(prev.taken_at), 'days').days));
   }
-  return { meter, value, delta, days, takenAt };
+  return { meter, value, delta, days, takenAt, replaced };
 }
 
 /**
  * Клавиатура счётчиков: кнопка на каждый + ввод всех сразу.
  * Рядом с названием — последнее показание, чтобы видеть, что вводишь поверх.
  */
-export function renderOne({ meter, value, delta, days, takenAt }) {
+export function renderOne({ meter, value, delta, days, takenAt, replaced }) {
   const unit = meter.unit ? ` ${esc(meter.unit)}` : '';
   let tail = '';
   if (delta === null) tail = '\n<i>первое показание</i>';
@@ -355,7 +474,11 @@ export function renderOne({ meter, value, delta, days, takenAt }) {
   const dated = takenAt
     ? ` <i>(на ${DateTime.fromJSDate(takenAt).setZone(TZ).toFormat('dd.MM')})</i>`
     : '';
-  return `📟 <b>${esc(displayName(meter))}</b>: ${fmtNum(value)}${unit}${dated}${tail}`;
+  const fixed =
+    replaced != null && replaced !== Number(value)
+      ? `\n<i>заменил прежнее ${fmtNum(replaced)} за этот же день</i>`
+      : '';
+  return `📟 <b>${esc(displayName(meter))}</b>: ${fmtNum(value)}${unit}${dated}${tail}${fixed}`;
 }
 
 export async function metersKeyboard() {
