@@ -986,8 +986,23 @@ bot.on('message:text', async (ctx, next) => {
     return applyEdit(ctx, state.target_id, text);
   }
 
-  // 3. В группе не перехватываем всю болтовню — только явные «+задача»
-  if (!isPrivate && !text.startsWith('+')) return;
+  // 3. В группе не перехватываем всю болтовню — только явные «+задача».
+  //    Исключение: прямое обращение к боту — там человек явно ждёт ответа,
+  //    и молчание выглядит как поломка.
+  if (!isPrivate && !text.startsWith('+')) {
+    const addressed =
+      ctx.message.reply_to_message?.from?.id === ctx.me.id ||
+      new RegExp(`@${ctx.me.username}`, 'i').test(text);
+    if (addressed) {
+      await ctx.reply(
+        'В группе задача ставится сообщением с <b>+</b> в начале:\n' +
+          '<code>+завтра в 18:00 забрать посылку</code>\n\n' +
+          'Ещё есть /today, /buy, /home — полный список по слешу.',
+        { parse_mode: 'HTML' }
+      );
+    }
+    return;
+  }
 
   // 4. Ответ на чужое сообщение: текст оттуда становится задачей,
   //    а написанное сейчас — уточнением времени
@@ -1233,6 +1248,45 @@ bot.callbackQuery(/^notmine:(\d+)$/, async (ctx) => {
   await q('update tasks set assignee_id = null, updated_at=now() where id=$1', [id]);
   await ctx.answerCallbackQuery('Снял исполнителя');
 });
+
+/**
+ * Меню команд Telegram — то, что всплывает при вводе слеша и по кнопке «Меню».
+ * Прописываем из кода, а не руками в BotFather: иначе список устаревает
+ * при каждой новой команде и никто об этом не вспоминает.
+ *
+ * В группе показываем только осмысленное там: клавиатуры внизу нет,
+ * зато нет и смысла предлагать личные настройки.
+ */
+const PRIVATE_COMMANDS = [
+  { command: 'today', description: 'задачи на сегодня' },
+  { command: 'week', description: 'план на неделю' },
+  { command: 'buy', description: 'список покупок' },
+  { command: 'home', description: 'счётчики, коммуналка, тарифы' },
+  { command: 'bill', description: 'посчитать коммуналку' },
+  { command: 'meter', description: 'счётчики и показания' },
+  { command: 'recur', description: 'повторяющиеся задачи' },
+  { command: 'list', description: 'все открытые задачи' },
+  { command: 'cal', description: 'подключённые календари' },
+  { command: 'calfeed', description: 'подписка на календарь' },
+  { command: 'learned', description: 'чему бот научился' },
+  { command: 'parse', description: 'проверить разбор фразы' },
+  { command: 'help', description: 'что я умею' },
+];
+
+const GROUP_COMMANDS = [
+  { command: 'today', description: 'задачи на сегодня' },
+  { command: 'week', description: 'план на неделю' },
+  { command: 'buy', description: 'список покупок' },
+  { command: 'home', description: 'счётчики и коммуналка' },
+  { command: 'recur', description: 'повторяющиеся задачи' },
+  { command: 'help', description: 'что я умею' },
+];
+
+export async function registerCommands() {
+  await bot.api.setMyCommands(PRIVATE_COMMANDS, { scope: { type: 'all_private_chats' } });
+  await bot.api.setMyCommands(GROUP_COMMANDS, { scope: { type: 'all_group_chats' } });
+  console.log('[bot] меню команд обновлено');
+}
 
 bot.catch((err) => console.error('[bot] необработанная ошибка:', err.message));
 
