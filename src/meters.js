@@ -517,6 +517,7 @@ export async function metersKeyboard() {
   }
 
   if (meters.length > 1) kb.text('📥 Ввести все сразу', 'meter_all').row();
+  if (meters.length) kb.text('🧾 Посчитать коммуналку', 'home_bill').row();
   kb.text('➕ Добавить счётчик', 'meter_new');
   if (!meters.length) kb.row().text('⚡️ Типовой набор', 'meter_preset');
   return kb;

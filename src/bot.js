@@ -20,6 +20,7 @@ import {
 } from './shopping.js';
 import { parseFallback } from './parser.js';
 import { feedToken, publicUrl } from './feed.js';
+import { saveExample, renderExamples, deactivateExample } from './learning.js';
 import {
   computeBill,
   renderBill,
@@ -74,7 +75,7 @@ const mainKeyboard = new Keyboard()
   .text('📆 Неделя')
   .text('🔁 Повторы')
   .row()
-  .text('📟 Счётчики')
+  .text('🏠 Дом')
   .resized();
 
 const exitKeyboard = new Keyboard().text('✅ Выйти').resized();
@@ -186,12 +187,13 @@ bot.command('help', (ctx) =>
       `«каждое 29 число», «каждый предпоследний день месяца», «каждый первый понедельник месяца», ` +
       `«каждые 2 недели», «ежедневно».\n\n` +
       `<b>Ещё</b>\nОтветьте на чужое сообщение словом «+завтра в 18:00» — задача создастся из того сообщения.\n` +
-      `В личке внизу есть кнопки: покупки, сегодня, неделя, повторы.\n\n` +
+      `В личке внизу есть кнопки: покупки, сегодня, неделя, повторы и «Дом».\n\n` +
       `<b>Команды</b>\n` +
       `/today — что сегодня\n/week — на неделю\n/list — все открытые\n` +
       `/done ID — закрыть\n/del ID — удалить\n/edit ID текст — изменить\n` +
       `/buy — список покупок\n/meter — счётчики и показания\n` +
-      `/calfeed — подписка на календарь\n/bill — расчёт коммуналки\n` +
+      `/home — счётчики, коммуналка, тарифы\n/learned — чему бот научился\n` +
+      `/calfeed — подписка на календарь\n` +
       `/recur — повторяющиеся задачи\n` +
       `/cal add URL — подключить календарь (ссылка .ics)\n` +
       `/cal list, /cal del ID\n/sync — синхронизировать календари сейчас\n` +
@@ -378,8 +380,8 @@ async function createTaskFromText(ctx, text) {
     const { rows } = await c.query(
       `insert into tasks
          (title, due_at, is_all_day, tz, assignee_id, creator_id, chat_id, thread_id, offsets,
-          is_private)
-       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) returning *`,
+          is_private, raw_input)
+       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) returning *`,
       [
         parsed.title,
         parsed.dueAt,
@@ -391,6 +393,7 @@ async function createTaskFromText(ctx, text) {
         ctx.message?.message_thread_id || null,
         JSON.stringify(offsets),
         ctx.chat.type === 'private',
+        text,
       ]
     );
     await regenerateReminders(rows[0], c);
@@ -613,6 +616,10 @@ bot.callbackQuery('buy_add', async (ctx) => {
 
 async function applyEdit(ctx, id, text) {
   const parsed = await parseTask(text);
+
+  // Что бот понял в первый раз — чтобы было с чем сравнивать
+  const { rows: before } = await q('select raw_input, created_at from tasks where id = $1', [id]);
+  const original = before[0];
   const assignee = parsed.assigneeUsername ? await findUserByUsername(parsed.assigneeUsername) : null;
 
   const task = await withTx(async (c) => {
@@ -636,8 +643,29 @@ async function applyEdit(ctx, id, text) {
   });
 
   if (!task) return ctx.reply('Не нашёл такую открытую задачу');
+
+  // Урок: исходная фраза должна была разобраться так, как получилось сейчас.
+  // Учимся только на карандаше — перенос кнопкой или удаление слишком шумные.
+  let learned = false;
+  if (original?.raw_input && original.raw_input.trim() !== text.trim()) {
+    try {
+      const user = await upsertUser(ctx.from, ctx.chat);
+      await saveExample({
+        input: original.raw_input,
+        nowAt: original.created_at,
+        parsed,
+        userId: user.id,
+      });
+      learned = true;
+    } catch (e) {
+      console.warn('[learn] не сохранил пример:', e.message);
+    }
+  }
+
   return ctx.reply(
-    `✏️ <b>${esc(task.title)}</b>\n🗓 ${fmt(new Date(task.due_at), TZ, task.is_all_day)}\n<code>#${task.id}</code>`,
+    `✏️ <b>${esc(task.title)}</b>\n🗓 ${fmt(new Date(task.due_at), TZ, task.is_all_day)}\n` +
+      `<code>#${task.id}</code>` +
+      (learned ? '\n<i>Запомнил, как вы это формулируете</i>' : ''),
     { parse_mode: 'HTML', reply_markup: taskKeyboard(task.id, task.recurrence_id, task.title) }
   );
 }
@@ -862,7 +890,7 @@ bot.on('message:text', async (ctx, next) => {
     if (text === '📋 Сегодня') return showToday(ctx);
     if (text === '📆 Неделя') return showWeek(ctx);
     if (text === '🔁 Повторы') return showRecurrences(ctx);
-    if (text === '📟 Счётчики') return showMeters(ctx);
+    if (text === '🏠 Дом') return showHome(ctx);
     if (text === '✅ Выйти') {
       const u = await upsertUser(ctx.from, ctx.chat);
       await clearState(u.id);
@@ -1051,6 +1079,59 @@ bot.callbackQuery(/^snoozeto:(\d+):(evening|morning|weekend)$/, async (ctx) => {
 });
 
 // --- счётчики ---------------------------------------------------------------
+
+/**
+ * Раздел «Дом» — всё про квартиру в одном месте.
+ * Нижнее меню держим на пяти кнопках: дальше оно превращается в свалку.
+ */
+function homeKeyboard() {
+  return new InlineKeyboard()
+    .text('📟 Счётчики', 'home_meters')
+    .text('🧾 Коммуналка', 'home_bill')
+    .row()
+    .text('💰 Тарифы', 'home_tariffs');
+}
+
+async function showHome(ctx) {
+  return ctx.reply(
+    '🏠 <b>Дом</b>\n\n' +
+      'Счётчики — внести показания и посмотреть расход.\n' +
+      'Коммуналка — расчёт за период по последним показаниям.\n' +
+      'Тарифы — цены и абонплаты с историей изменений.',
+    { parse_mode: 'HTML', reply_markup: homeKeyboard() }
+  );
+}
+
+bot.callbackQuery('home_meters', async (ctx) => {
+  await ctx.answerCallbackQuery();
+  return showMeters(ctx);
+});
+
+bot.callbackQuery('home_bill', async (ctx) => {
+  await ctx.answerCallbackQuery();
+  const bill = await computeBill();
+  return ctx.reply(await renderBill(bill), { parse_mode: 'HTML' });
+});
+
+bot.callbackQuery('home_tariffs', async (ctx) => {
+  await ctx.answerCallbackQuery();
+  return ctx.reply(await listCharges(), { parse_mode: 'HTML' });
+});
+
+bot.command('home', (ctx) => showHome(ctx));
+
+bot.command('learned', async (ctx) => {
+  const args = (ctx.match || '').trim().split(/\s+/).filter(Boolean);
+  if (args[0]?.toLowerCase() === 'del') {
+    const id = Number(String(args[1] || '').replace(/[#E]/gi, ''));
+    const gone = id ? await deactivateExample(id) : null;
+    return ctx.reply(
+      gone ? `Забыл: «${esc(gone.input)}»` : 'Формат: /learned del E3',
+      { parse_mode: 'HTML' }
+    );
+  }
+  return ctx.reply(await renderExamples(), { parse_mode: 'HTML' });
+});
 
 async function showMeters(ctx) {
   return ctx.reply(await renderSummary(), {

@@ -1,4 +1,5 @@
 import { DateTime, TZ, ALL_DAY_HOUR } from './time.js';
+import { examplesBlock } from './learning.js';
 
 /**
  * Разбирает фразу вида «завтра в 18:30 забрать посылку, напомни за день и за 2 часа»
@@ -25,6 +26,14 @@ export async function parseTask(text, { tz = TZ, now = DateTime.now().setZone(TZ
 const MODEL = process.env.ANTHROPIC_MODEL || 'claude-haiku-4-5-20251001';
 
 async function parseWithClaude(text, tz, now) {
+  // Примеры из исправлений: чем дольше живёт бот, тем точнее разбор
+  let learned = '';
+  try {
+    learned = await examplesBlock();
+  } catch (e) {
+    console.warn('[parser] примеры недоступны:', e.message);
+  }
+
   const system = `Ты парсер бытовых задач. Отвечай ТОЛЬКО валидным JSON, без markdown и пояснений.
 Схема:
 {"title": string, "due_at": string|null, "is_all_day": boolean, "offsets": string[], "assignee": string|null}
@@ -35,7 +44,7 @@ async function parseWithClaude(text, tz, now) {
 - любое явно указанное время суток ("в 18:00", "именно в 18:00") ВСЕГДА попадает в due_at, is_all_day при этом false — даже если время названо в конце фразы или повторно
 - assignee — telegram-username без @, если задача явно на кого-то; иначе null
 - title — короткий, без даты/времени/слов про напоминания
-Сейчас: ${now.toISO()} (${tz}).`;
+Сейчас: ${now.toISO()} (${tz}).${learned}`;
 
   const res = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',

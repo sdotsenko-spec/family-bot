@@ -2,8 +2,13 @@
  * Оффлайн-проверка парсера и офсетов. БД и Telegram не нужны:
  *   node src/selftest.js
  */
-import { parseFallback } from './parser.js';
-import { offsetToMs, humanOffset, DateTime, TZ } from './time.js';
+// parser.js тянет learning.js → db.js, которому нужен DATABASE_URL.
+// Поэтому переменную выставляем ДО импортов, а сами импорты делаем
+// динамическими: статические поднимаются наверх и сработали бы раньше.
+process.env.DATABASE_URL ||= 'postgresql://localhost:5432/selftest';
+
+const { parseFallback } = await import('./parser.js');
+const { offsetToMs, humanOffset, DateTime, TZ } = await import('./time.js');
 
 const NOW = DateTime.fromISO('2026-07-26T14:00:00', { zone: TZ }); // воскресенье
 
@@ -75,7 +80,6 @@ for (const [label, expected] of [
 {
   // reminders.js тянет db.js, которому нужен DATABASE_URL. Пул создаётся,
   // но никуда не подключается — для чистой функции этого достаточно.
-  process.env.DATABASE_URL ||= 'postgresql://localhost:5432/selftest';
   const { chooseTargets } = await import('./reminders.js');
   const GROUP = -1001111111111;
   const DM = 555000111;
