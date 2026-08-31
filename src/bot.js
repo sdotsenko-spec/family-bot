@@ -364,6 +364,38 @@ bot.command('cal', async (ctx) => {
 
 // --- создание задачи --------------------------------------------------------
 
+/**
+ * Карточка задачи. Одна на создание, правку и перенос: раньше они показывали
+ * разное, и после редактирования пропадал список напоминаний.
+ */
+async function renderTaskCard(task, { icon = '📌', note = '' } = {}) {
+  const { rows: who } = task.assignee_id
+    ? await q('select name from users where id = $1', [task.assignee_id])
+    : { rows: [] };
+
+  const { rows: rems } = await q(
+    `select label from reminders where task_id=$1 and status='pending' order by fire_at`,
+    [task.id]
+  );
+
+  const planned = rems.map((r) => humanOffset(r.label)).filter((l) => l !== 'просрочено');
+
+  const overdue =
+    new Date(task.due_at) < new Date()
+      ? '\n\n⚠️ Указанное время уже прошло — напоминаний не будет.'
+      : '';
+
+  return (
+    `${icon} <b>${esc(task.title)}</b>${task.is_private ? ' 🔒' : ''}\n` +
+    `🗓 ${fmt(new Date(task.due_at), TZ, task.is_all_day)}\n` +
+    (who.length ? `👤 ${esc(who[0].name)}\n` : '') +
+    `🔔 напомню: ${planned.length ? planned.join(', ') : 'нет (срок слишком близко)'}\n` +
+    `<code>#${task.id}</code>` +
+    overdue +
+    note
+  );
+}
+
 async function createTaskFromText(ctx, text) {
   // Сначала проверяем, не описано ли повторение — иначе «каждый вторник»
   // молча превратилось бы в разовую задачу на ближайший вторник
@@ -400,36 +432,15 @@ async function createTaskFromText(ctx, text) {
     return rows[0];
   });
 
-  const { rows: rems } = await q(
-    `select label, fire_at from reminders where task_id=$1 and status='pending' order by fire_at`,
-    [task.id]
-  );
-
-  const planned = rems.length
-    ? rems.map((r) => humanOffset(r.label)).filter((l) => l !== 'просрочено').join(', ')
-    : 'нет (срок слишком близко)';
-
-  const overdue =
-    new Date(task.due_at) < new Date()
-      ? '\n\n⚠️ Указанное время уже прошло — напоминаний не будет. ' +
-        'Поправьте кнопкой «Изменить», если ошиблись с датой.'
-      : '';
-
   const warn = looksRecurring(text)
     ? '\n\n⚠️ Похоже на повторяющуюся задачу, но правило распознать не вышло — ' +
       'поставил разовую. Попробуйте формулировку вида «каждый вторник в 20:00 …».'
     : '';
 
-  await ctx.reply(
-    `📌 <b>${esc(task.title)}</b>${task.is_private ? ' 🔒' : ''}\n` +
-      `🗓 ${fmt(new Date(task.due_at), TZ, task.is_all_day)}\n` +
-      (assignee ? `👤 ${esc(assignee.name)}\n` : '') +
-      `🔔 напомню: ${planned}\n` +
-      `<code>#${task.id}</code>` +
-      overdue +
-      warn,
-    { parse_mode: 'HTML', reply_markup: taskKeyboard(task.id, task.recurrence_id, task.title) }
-  );
+  await ctx.reply(await renderTaskCard(task, { note: warn }), {
+    parse_mode: 'HTML',
+    reply_markup: taskKeyboard(task.id, task.recurrence_id, task.title),
+  });
   return task;
 }
 
@@ -663,9 +674,10 @@ async function applyEdit(ctx, id, text) {
   }
 
   return ctx.reply(
-    `✏️ <b>${esc(task.title)}</b>\n🗓 ${fmt(new Date(task.due_at), TZ, task.is_all_day)}\n` +
-      `<code>#${task.id}</code>` +
-      (learned ? '\n<i>Запомнил, как вы это формулируете</i>' : ''),
+    await renderTaskCard(task, {
+      icon: '✏️',
+      note: learned ? '\n<i>Запомнил, как вы это формулируете</i>' : '',
+    }),
     { parse_mode: 'HTML', reply_markup: taskKeyboard(task.id, task.recurrence_id, task.title) }
   );
 }
@@ -1086,10 +1098,10 @@ bot.callbackQuery(/^snoozeto:(\d+):(evening|morning|weekend)$/, async (ctx) => {
   const task = await rescheduleTask(id, target.toJSDate());
   await ctx.answerCallbackQuery(task ? 'Перенёс' : 'Задача не найдена');
   if (task) {
-    await ctx.editMessageText(
-      `⏰ <b>${esc(task.title)}</b>\nперенесено на ${fmt(new Date(task.due_at), TZ, task.is_all_day)}`,
-      { parse_mode: 'HTML', reply_markup: taskKeyboard(task.id, task.recurrence_id, task.title) }
-    );
+    await ctx.editMessageText(await renderTaskCard(task, { icon: '⏰' }), {
+      parse_mode: 'HTML',
+      reply_markup: taskKeyboard(task.id, task.recurrence_id, task.title),
+    });
   }
 });
 
