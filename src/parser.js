@@ -83,7 +83,9 @@ question — задай его, если формулировка допуска
     },
     body: JSON.stringify({
       model: MODEL,
-      max_tokens: 400,
+      // Хватает на список задач: одна задача ~100 токенов, а «разбей на 4»
+      // в старые 400 не влезало — JSON обрывался и всё падало в фолбэк
+      max_tokens: 2000,
       system,
       messages: [{ role: 'user', content: text }],
     }),
@@ -91,6 +93,12 @@ question — задай его, если формулировка допуска
 
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const data = await res.json();
+
+  // Обрыв по лимиту даёт невалидный JSON, и без этой проверки причина
+  // выглядела бы как «модель вернула чушь»
+  if (data.stop_reason === 'max_tokens') {
+    throw new Error('ответ обрезан по max_tokens');
+  }
   const raw = (data.content || [])
     .filter((b) => b.type === 'text')
     .map((b) => b.text)
@@ -98,7 +106,12 @@ question — задай его, если формулировка допуска
     .replace(/```json|```/g, '')
     .trim();
 
-  const parsed = JSON.parse(raw);
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error(`невалидный JSON: ${raw.slice(0, 120)}`);
+  }
 
   if (parsed.question && (!parsed.tasks || !parsed.tasks.length)) {
     return { question: String(parsed.question).trim(), tasks: [] };
