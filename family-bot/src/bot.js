@@ -212,8 +212,7 @@ bot.command('parse', async (ctx) => {
   const rec = parseRecurrence(text);
   const rest = rec ? rec.rest : text;
 
-  const parsedAll = await parseTask(rest);   // тот же путь, что при создании
-  const llm = parsedAll.tasks?.[0] || null;
+  const llm = await parseTask(rest);          // тот же путь, что при создании
   const regex = parseFallback(rest);          // всегда регулярки, для сравнения
 
   const show = (p) =>
@@ -226,9 +225,7 @@ bot.command('parse', async (ctx) => {
     `<b>Разбор</b>\n` +
       `повтор: ${rec ? esc(describeRrule(rec.rrule)) + ` <code>${esc(rec.rrule)}</code>` : 'нет'}\n` +
       `остаток: «${esc(rest)}»\n\n` +
-      (parsedAll.question ? `<b>Вопрос от бота</b>\n      ${esc(parsedAll.question)}\n\n` : '') +
-      (parsedAll.tasks?.length > 1 ? `<b>Задач в сообщении: ${parsedAll.tasks.length}</b>\n\n` : '') +
-      (llm ? `<b>Итог</b> (${viaLlm ? 'через Claude' : 'регулярки'})\n      ${show(llm)}\n\n` : '') +
+      `<b>Итог</b> (${viaLlm ? 'через Claude' : 'регулярки'})\n      ${show(llm)}\n\n` +
       (viaLlm ? `<b>Регулярки для сравнения</b>\n      ${show(regex)}\n\n` : '') +
       `<i>таймзона ${TZ}</i>`,
     { parse_mode: 'HTML' }
@@ -399,41 +396,6 @@ async function renderTaskCard(task, { icon = '📌', note = '' } = {}) {
   );
 }
 
-/** Создаёт одну задачу из разобранного объекта. Общее место для всех путей. */
-async function insertTask(ctx, parsed, { rawInput, creatorId }) {
-  const assignee = parsed.assigneeUsername
-    ? await findUserByUsername(parsed.assigneeUsername)
-    : null;
-  const offsets = parsed.offsets?.length ? parsed.offsets : DEFAULT_OFFSETS;
-
-  return withTx(async (c) => {
-    const { rows } = await c.query(
-      `insert into tasks
-         (title, due_at, is_all_day, tz, assignee_id, creator_id, chat_id, thread_id, offsets,
-          is_private, raw_input, nag_every_min, nag_from, nag_to)
-       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::int,$13::time,$14::time) returning *`,
-      [
-        parsed.title,
-        parsed.dueAt,
-        parsed.isAllDay,
-        TZ,
-        assignee?.id || null,
-        creatorId,
-        ctx.chat.id,
-        ctx.message?.message_thread_id || null,
-        JSON.stringify(offsets),
-        ctx.chat.type === 'private',
-        rawInput,
-        parsed.nag?.everyMinutes || null,
-        parsed.nag?.from || null,
-        parsed.nag?.to || null,
-      ]
-    );
-    await regenerateReminders(rows[0], c);
-    return rows[0];
-  });
-}
-
 async function createTaskFromText(ctx, text) {
   // Сначала проверяем, не описано ли повторение — иначе «каждый вторник»
   // молча превратилось бы в разовую задачу на ближайший вторник
@@ -441,32 +403,34 @@ async function createTaskFromText(ctx, text) {
   if (found) return createRecurrenceFromText(ctx, text, found);
 
   const creator = await upsertUser(ctx.from, ctx.chat);
-  const { tasks, question } = await parseTask(text);
+  const parsed = await parseTask(text);
+  const assignee = parsed.assigneeUsername ? await findUserByUsername(parsed.assigneeUsername) : null;
 
-  // Модель не уверена — переспрашиваем, а не угадываем
-  if (question) {
-    const { rows } = await q(
-      `insert into pending_parses (user_id, chat_id, thread_id, raw_input, payload, is_private)
-       values ($1,$2,$3,$4,$5,$6) returning id`,
+  const offsets = parsed.offsets.length ? parsed.offsets : DEFAULT_OFFSETS;
+
+  const task = await withTx(async (c) => {
+    const { rows } = await c.query(
+      `insert into tasks
+         (title, due_at, is_all_day, tz, assignee_id, creator_id, chat_id, thread_id, offsets,
+          is_private, raw_input)
+       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) returning *`,
       [
+        parsed.title,
+        parsed.dueAt,
+        parsed.isAllDay,
+        TZ,
+        assignee?.id || null,
         creator.id,
         ctx.chat.id,
         ctx.message?.message_thread_id || null,
-        text,
-        JSON.stringify({ question }),
+        JSON.stringify(offsets),
         ctx.chat.type === 'private',
+        text,
       ]
     );
-    await setState(creator.id, 'answer', rows[0].id, { chatId: ctx.chat.id, oneShot: true });
-    return ctx.reply(`❓ ${esc(question)}`, { parse_mode: 'HTML' });
-  }
-
-  if (!tasks?.length) return ctx.reply('Не понял, что нужно сделать. Попробуйте иначе.');
-
-  // Несколько задач из одной фразы — сначала предпросмотр, потом создание
-  if (tasks.length > 1) return previewTasks(ctx, creator, text, tasks);
-
-  const task = await insertTask(ctx, tasks[0], { rawInput: text, creatorId: creator.id });
+    await regenerateReminders(rows[0], c);
+    return rows[0];
+  });
 
   const warn = looksRecurring(text)
     ? '\n\n⚠️ Похоже на повторяющуюся задачу, но правило распознать не вышло — ' +
@@ -480,83 +444,10 @@ async function createTaskFromText(ctx, text) {
   return task;
 }
 
-/**
- * Предпросмотр нескольких задач. Создавать четыре штуки молча слишком грубо:
- * если модель ошиблась, разгребать придётся руками.
- */
-async function previewTasks(ctx, creator, text, tasks) {
-  const { rows } = await q(
-    `insert into pending_parses (user_id, chat_id, thread_id, raw_input, payload, is_private)
-     values ($1,$2,$3,$4,$5,$6) returning id`,
-    [
-      creator.id,
-      ctx.chat.id,
-      ctx.message?.message_thread_id || null,
-      text,
-      JSON.stringify({ tasks }),
-      ctx.chat.type === 'private',
-    ]
-  );
-
-  const lines = tasks.map((t, i) => {
-    const when = fmt(new Date(t.dueAt), TZ, t.isAllDay);
-    const nag = t.nag
-      ? ` · 🔁 каждые ${Math.round(t.nag.everyMinutes / 60) || 1} ч с ${t.nag.from} до ${t.nag.to}`
-      : '';
-    return `${i + 1}. <b>${esc(t.title)}</b>\n     ${when}${nag}`;
-  });
-
-  return ctx.reply(
-    `📋 Получилось <b>${tasks.length}</b> задачи:\n\n${lines.join('\n')}\n\nСоздать?`,
-    {
-      parse_mode: 'HTML',
-      reply_markup: new InlineKeyboard()
-        .text('✅ Создать все', `pend_ok:${rows[0].id}`)
-        .row()
-        .text('🗑 Отмена', `pend_no:${rows[0].id}`),
-    }
-  );
-}
-
-bot.callbackQuery(/^pend_ok:(\d+)$/, async (ctx) => {
-  const { rows } = await q('select * from pending_parses where id = $1', [Number(ctx.match[1])]);
-  if (!rows.length) return ctx.answerCallbackQuery('Устарело');
-  const pending = rows[0];
-  await ctx.answerCallbackQuery('Создаю');
-
-  const created = [];
-  for (const parsed of pending.payload.tasks || []) {
-    const task = await insertTask(
-      ctx,
-      { ...parsed, dueAt: new Date(parsed.dueAt) },
-      { rawInput: pending.raw_input, creatorId: pending.user_id }
-    );
-    created.push(task);
-  }
-  await q('delete from pending_parses where id = $1', [pending.id]);
-
-  await ctx.editMessageText(`✅ Создано задач: ${created.length}`);
-  for (const task of created) {
-    await ctx.reply(await renderTaskCard(task), {
-      parse_mode: 'HTML',
-      reply_markup: taskKeyboard(task.id, task.recurrence_id, task.title),
-    });
-    await new Promise((r) => setTimeout(r, 120));
-  }
-});
-
-bot.callbackQuery(/^pend_no:(\d+)$/, async (ctx) => {
-  await q('delete from pending_parses where id = $1', [Number(ctx.match[1])]);
-  await ctx.answerCallbackQuery('Отменил');
-  await ctx.editMessageText('🗑 Отменено');
-});
-
 async function createRecurrenceFromText(ctx, original, found) {
   const creator = await upsertUser(ctx.from, ctx.chat);
   // Время суток и название берём из остатка фразы, дату задаёт само правило
-  const { tasks: recList } = await parseTask(found.rest || original);
-  const parsed = recList?.[0];
-  if (!parsed) return ctx.reply('Не понял текст правила');
+  const parsed = await parseTask(found.rest || original);
   const assignee = parsed.assigneeUsername ? await findUserByUsername(parsed.assigneeUsername) : null;
   const offsets = parsed.offsets.length ? parsed.offsets : DEFAULT_OFFSETS;
 
@@ -735,9 +626,7 @@ bot.callbackQuery('buy_add', async (ctx) => {
 // --- редактирование ---------------------------------------------------------
 
 async function applyEdit(ctx, id, text) {
-  const { tasks: parsedList } = await parseTask(text);
-  const parsed = parsedList?.[0];
-  if (!parsed) return ctx.reply('Не понял новый текст задачи');
+  const parsed = await parseTask(text);
 
   // Что бот понял в первый раз — чтобы было с чем сравнивать
   const { rows: before } = await q('select raw_input, created_at from tasks where id = $1', [id]);
@@ -1102,15 +991,6 @@ bot.on('message:text', async (ctx, next) => {
     }
     await ctx.reply('Не нашёл чисел. Пришлите показания цифрами или нажмите «Выйти».');
     return;
-  }
-
-  if (state?.mode === 'answer') {
-    await clearState(state.uid);
-    const { rows } = await q('select * from pending_parses where id = $1', [state.target_id]);
-    await q('delete from pending_parses where id = $1', [state.target_id]);
-    if (!rows.length) return createTaskFromText(ctx, text);
-    // Склеиваем исходную фразу с ответом — так модель получит полный контекст
-    return createTaskFromText(ctx, `${rows[0].raw_input}\n\nУточнение: ${text}`);
   }
 
   if (state?.mode === 'edit') {

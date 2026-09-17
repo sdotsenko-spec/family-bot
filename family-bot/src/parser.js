@@ -9,15 +9,6 @@ import { examplesBlock } from './learning.js';
  * формулировки. Если ключа нет или API упал — работает регексповый фолбэк,
  * его достаточно для 90% бытовых фраз.
  */
-// Чаще раза в час не долбим ничем и никогда — иначе бота выключат
-export const MIN_NAG_MINUTES = 60;
-
-/**
- * Возвращает { tasks: [...], question: string|null }.
- * Задач может быть несколько: «разбей на 4 отдельных» — рабочая формулировка.
- * question заполняется, когда модель не уверена и лучше переспросить,
- * чем угадать: молчаливая догадка обходится дороже лишнего вопроса.
- */
 export async function parseTask(text, { tz = TZ, now = DateTime.now().setZone(TZ) } = {}) {
   if (process.env.ANTHROPIC_API_KEY) {
     try {
@@ -27,8 +18,7 @@ export async function parseTask(text, { tz = TZ, now = DateTime.now().setZone(TZ
       console.warn('[parser] Claude недоступен, фолбэк:', e.message);
     }
   }
-  // Регулярки нескольких задач не умеют — отдают одну, но в том же формате
-  return { tasks: [parseFallback(text, tz, now)], question: null };
+  return parseFallback(text, tz, now);
 }
 
 // --- LLM --------------------------------------------------------------------
@@ -45,33 +35,15 @@ async function parseWithClaude(text, tz, now) {
   }
 
   const system = `Ты парсер бытовых задач. Отвечай ТОЛЬКО валидным JSON, без markdown и пояснений.
-
-Схема ответа:
-{"tasks": Task[], "question": string|null}
-
-Task:
-{"title": string, "due_at": string, "is_all_day": boolean, "offsets": string[],
- "assignee": string|null, "nag": {"every_minutes": number, "from": "HH:MM", "to": "HH:MM"}|null}
-
-- В одном сообщении может быть НЕСКОЛЬКО задач: нумерованный или маркированный
-  список, либо прямая просьба «разбей на N отдельных» — верни их отдельными
-  элементами tasks, у каждого свой title.
+Схема:
+{"title": string, "due_at": string|null, "is_all_day": boolean, "offsets": string[], "assignee": string|null}
 - due_at — ISO 8601 со смещением, в таймзоне ${tz}
 - если время не указано — is_all_day=true, due_at на ${ALL_DAY_HOUR}:00 нужного дня
-- offsets — интервалы ДО срока, вида ["24h","3h","30m"]; если не просили — []
-- если названо только КОЛИЧЕСТВО напоминаний ("напоминай 2 раза"): 1 → ["30m"], 2 → ["24h","30m"], 3 → ["24h","3h","30m"]
-- nag — для формулировок «напоминать раз в N часов», «висеть весь день, пока не
-  отмечу», «долби с 11 до 19». every_minutes — период, from/to — окно суток.
-  Если окно не названо, бери 09:00–21:00. Во всех прочих случаях nag=null.
-- любое явно указанное время суток ВСЕГДА попадает в due_at, is_all_day=false
+- offsets — массив вида ["24h","3h","30m"]; если пользователь не просил — верни []
+- если названо только КОЛИЧЕСТВО напоминаний ("напоминай 2 раза"), верни столько интервалов: 1 → ["30m"], 2 → ["24h","30m"], 3 → ["24h","3h","30m"]
+- любое явно указанное время суток ("в 18:00", "именно в 18:00") ВСЕГДА попадает в due_at, is_all_day при этом false — даже если время названо в конце фразы или повторно
 - assignee — telegram-username без @, если задача явно на кого-то; иначе null
 - title — короткий, без даты/времени/слов про напоминания
-
-question — задай его, если формулировка допускает разные прочтения и ошибка
-дорого обойдётся: непонятно, одна это задача или несколько; не ясен день;
-непонятно, на кого. Если спрашиваешь — верни tasks: [] и текст вопроса.
-Не переспрашивай в очевидных случаях.
-
 Сейчас: ${now.toISO()} (${tz}).${learned}`;
 
   const res = await fetch('https://api.anthropic.com/v1/messages', {
@@ -99,39 +71,19 @@ question — задай его, если формулировка допуска
     .trim();
 
   const parsed = JSON.parse(raw);
+  if (!parsed.title) return null;
 
-  if (parsed.question && (!parsed.tasks || !parsed.tasks.length)) {
-    return { question: String(parsed.question).trim(), tasks: [] };
-  }
+  const due = parsed.due_at
+    ? DateTime.fromISO(parsed.due_at, { zone: tz })
+    : now.plus({ days: 1 }).set({ hour: ALL_DAY_HOUR, minute: 0, second: 0, millisecond: 0 });
 
-  const list = Array.isArray(parsed.tasks) ? parsed.tasks : parsed.title ? [parsed] : [];
-  if (!list.length) return null;
-
-  const tasks = list
-    .filter((t) => t && t.title)
-    .map((t) => {
-      const due = t.due_at
-        ? DateTime.fromISO(t.due_at, { zone: tz })
-        : now.plus({ days: 1 }).set({ hour: ALL_DAY_HOUR, minute: 0, second: 0, millisecond: 0 });
-      return {
-        title: String(t.title).trim(),
-        dueAt: due.toJSDate(),
-        isAllDay: !!t.is_all_day,
-        offsets: Array.isArray(t.offsets) ? t.offsets : [],
-        assigneeUsername: t.assignee || null,
-        nag: normalizeNag(t.nag),
-      };
-    });
-
-  return tasks.length ? { tasks, question: null } : null;
-}
-
-/** Приводим окно долбёжки к разумным рамкам — модель может вернуть что угодно. */
-function normalizeNag(nag) {
-  if (!nag || !Number.isFinite(Number(nag.every_minutes))) return null;
-  const every = Math.max(MIN_NAG_MINUTES, Math.round(Number(nag.every_minutes)));
-  const time = (v, fallback) => (/^\d{1,2}:\d{2}$/.test(String(v || '')) ? v : fallback);
-  return { everyMinutes: every, from: time(nag.from, '09:00'), to: time(nag.to, '21:00') };
+  return {
+    title: parsed.title.trim(),
+    dueAt: due.toJSDate(),
+    isAllDay: !!parsed.is_all_day,
+    offsets: Array.isArray(parsed.offsets) ? parsed.offsets : [],
+    assigneeUsername: parsed.assignee || null,
+  };
 }
 
 // --- Фолбэк без LLM ---------------------------------------------------------

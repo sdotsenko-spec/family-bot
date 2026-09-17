@@ -1,6 +1,6 @@
 import { InlineKeyboard } from 'grammy';
 import { q, withTx, getSetting } from './db.js';
-import { offsetToMs, humanOffset, fmt, TZ, DateTime } from './time.js';
+import { offsetToMs, humanOffset, fmt, TZ } from './time.js';
 import { isMeterTask } from './meters.js';
 
 // Набор напоминаний по умолчанию — когда пользователь не указал свой.
@@ -23,11 +23,6 @@ const ESCALATION_ENABLED = process.env.ESCALATION !== 'off';
 //   key — только на первое по задаче и в момент наступления срока
 //   off — не дублировать
 const GROUP_PING = (process.env.GROUP_PING || 'all').toLowerCase();
-
-// Потолок навязчивости. Долбящая задача легко даёт шесть сообщений в день,
-// четыре таких — двадцать четыре, и бота выключают. Лимиты важнее удобства.
-const MAX_PER_DAY = Number(process.env.MAX_REMINDERS_PER_DAY || 20);
-const MIN_GAP_MIN = Number(process.env.MIN_REMINDER_GAP_MIN || 60);
 
 /**
  * Пересобирает напоминания задачи.
@@ -66,25 +61,6 @@ export async function regenerateReminders(taskOrId, client = null) {
 
   // Само наступление срока — тоже напоминание.
   if (due > now) rows.push([task.id, 'due', new Date(due)]);
-
-  // Режим «висеть весь день, пока не отмечу»: повторы в окне суток.
-  // Ограничиваем днём срока — бесконечная долбёжка никому не нужна.
-  if (task.nag_every_min) {
-    const every = Math.max(MIN_GAP_MIN, Number(task.nag_every_min)) * 60_000;
-    const day = DateTime.fromJSDate(new Date(task.due_at)).setZone(task.tz || TZ);
-    const [fh, fm] = String(task.nag_from || '09:00').split(':').map(Number);
-    const [th, tm] = String(task.nag_to || '21:00').split(':').map(Number);
-    const from = day.set({ hour: fh, minute: fm, second: 0, millisecond: 0 });
-    const to = day.set({ hour: th, minute: tm, second: 0, millisecond: 0 });
-
-    let cursor = from.toMillis();
-    let n = 0;
-    while (cursor <= to.toMillis() && n < 24) {
-      if (cursor > now) rows.push([task.id, `nag${n}`, new Date(cursor)]);
-      cursor += every;
-      n++;
-    }
-  }
 
   if (ESCALATION_ENABLED && due + ESCALATE_AFTER_MS > now) {
     rows.push([task.id, 'escalation', new Date(due + ESCALATE_AFTER_MS)]);
@@ -278,34 +254,6 @@ export async function dispatchDueReminders(bot) {
 
       if (!task || task.status !== 'pending') {
         await q(`update reminders set status='cancelled' where id = $1`, [reminder.id]);
-        continue;
-      }
-
-      // Потолок навязчивости: считаем, сколько уже отправлено за сутки
-      // в этот чат, и когда было последнее.
-      const { rows: stat } = await q(
-        `select count(*)::int as today,
-                max(r.sent_at) as last_at
-           from reminders r join tasks t on t.id = r.task_id
-          where r.status = 'sent'
-            and r.sent_at > now() - interval '24 hours'
-            and t.chat_id = $1`,
-        [task.chat_id]
-      );
-      const { today, last_at } = stat[0] || { today: 0, last_at: null };
-      const isNag = /^nag\d+$/.test(reminder.label);
-
-      if (isNag && today >= MAX_PER_DAY) {
-        await q(`update reminders set status='skipped' where id = $1`, [reminder.id]);
-        console.warn(`[reminders] #${reminder.id}: дневной лимит ${MAX_PER_DAY} исчерпан`);
-        continue;
-      }
-      if (
-        isNag &&
-        last_at &&
-        Date.now() - new Date(last_at).getTime() < MIN_GAP_MIN * 60_000
-      ) {
-        await q(`update reminders set status='skipped' where id = $1`, [reminder.id]);
         continue;
       }
 

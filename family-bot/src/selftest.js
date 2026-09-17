@@ -303,20 +303,5 @@ for (const [label, expected] of [
   check2('электричество июль', Number((400 * 4.32 + 166 * 2.16).toFixed(2)), 2086.56);
 }
 
-// --- контракт разбора: несколько задач, долбёжка, вопрос -------------------
-{
-  const { parseTask, MIN_NAG_MINUTES } = await import('./parser.js');
-
-  // Без ключа работает фолбэк — он всегда отдаёт ровно одну задачу,
-  // но в том же формате, что и модель
-  delete process.env.ANTHROPIC_API_KEY;
-  const r = await parseTask('завтра в 18:30 забрать посылку');
-  check2('фолбэк отдаёт массив задач', Array.isArray(r.tasks), true);
-  check2('фолбэк не задаёт вопросов', r.question, null);
-  check2('фолбэк — ровно одна задача', r.tasks.length, 1);
-  check2('заголовок разобран', r.tasks[0].title, 'забрать посылку');
-  check2('минимальный период долбёжки — час', MIN_NAG_MINUTES, 60);
-}
-
 console.log(failures ? `\n${failures} провалов` : '\nВсё зелёное');
 process.exit(failures ? 1 : 0);
