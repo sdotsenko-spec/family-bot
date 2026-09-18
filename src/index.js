@@ -5,6 +5,7 @@ import { bot, maybeSendDigest, registerCommands } from './bot.js';
 import { dispatchDueReminders } from './reminders.js';
 import { syncAllCalendars } from './calendar/ics.js';
 import { materializeAll } from './recurrence.js';
+import { topUpInboxReminders } from './reminders.js';
 import { buildFeed, feedToken } from './feed.js';
 
 const REMINDER_TICK_MS = 60_000;
@@ -42,6 +43,7 @@ async function main() {
 
   heartbeat('calendars', CAL_TICK_MS, syncAllCalendars);
   heartbeat('recurrences', 3_600_000, materializeAll); // раз в час достраиваем горизонт
+  heartbeat('inbox', 3_600_000, topUpInboxReminders); // и напоминания дел без срока
   heartbeat('digest', 60_000, maybeSendDigest);
 
   // Первый проход сразу после старта — добираем всё, что созрело за время деплоя

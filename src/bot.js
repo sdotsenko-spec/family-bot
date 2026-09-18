@@ -115,9 +115,18 @@ async function findUserByUsername(username) {
 
 function taskLine(t) {
   const mark =
-    t.status === 'done' ? '✅' : t.source === 'recur' ? '🔁' : t.source !== 'bot' ? '🗓' : '•';
+    t.status === 'done'
+      ? '✅'
+      : t.is_inbox
+        ? '📥'
+        : t.source === 'recur'
+          ? '🔁'
+          : t.source !== 'bot'
+            ? '🗓'
+            : '•';
   const who = t.assignee_name ? ` — ${esc(t.assignee_name)}` : '';
-  return `${mark} <b>${esc(t.title)}</b>${who}\n   ${fmt(new Date(t.due_at), t.tz || TZ, t.is_all_day)}  <code>#${t.id}</code>`;
+  const when = t.due_at ? fmt(new Date(t.due_at), t.tz || TZ, t.is_all_day) : 'без срока';
+  return `${mark} <b>${esc(t.title)}</b>${who}\n   ${when}  <code>#${t.id}</code>`;
 }
 
 function taskKeyboard(id, recurrenceId = null, title = '') {
@@ -267,8 +276,15 @@ async function listTasks(ctx, { from, to, title }) {
       order by t.due_at limit 50`,
     [from.toJSDate(), to.toJSDate()]
   );
-  if (!rows.length) return ctx.reply(`${title}: пусто 🎉`);
-  await ctx.reply(`<b>${title}</b>\n\n` + rows.map(taskLine).join('\n\n'), { parse_mode: 'HTML' });
+  const { rows: inbox } = await q(
+    `select count(*)::int as n from tasks where status='pending' and is_inbox = true`
+  );
+  const tail = inbox[0]?.n ? `\n\n📥 <i>Без срока: ${inbox[0].n}</i> — /inbox` : '';
+
+  if (!rows.length) return ctx.reply(`${title}: пусто 🎉${tail}`, { parse_mode: 'HTML' });
+  await ctx.reply(`<b>${title}</b>\n\n` + rows.map(taskLine).join('\n\n') + tail, {
+    parse_mode: 'HTML',
+  });
 }
 
 const showToday = (ctx) => {
@@ -281,6 +297,26 @@ const showWeek = (ctx) => {
   return listTasks(ctx, { from: now.startOf('day'), to: now.plus({ days: 7 }), title: 'Ближайшая неделя' });
 };
 
+async function showInbox(ctx) {
+  const { rows } = await q(
+    `select t.*, u.name as assignee_name
+       from tasks t left join users u on u.id = t.assignee_id
+      where t.status = 'pending' and t.is_inbox = true
+      order by t.created_at limit 50`
+  );
+  if (!rows.length) {
+    return ctx.reply(
+      '📥 Инбокс пуст.\n\nНапишите дело без даты — «купить стеллаж» — и оно ляжет сюда.',
+      { parse_mode: 'HTML' }
+    );
+  }
+  return ctx.reply(
+    `📥 <b>Без срока: ${rows.length}</b>\n\n` + rows.map(taskLine).join('\n\n'),
+    { parse_mode: 'HTML' }
+  );
+}
+
+bot.command('inbox', showInbox);
 bot.command('today', showToday);
 bot.command('week', showWeek);
 
@@ -384,15 +420,22 @@ async function renderTaskCard(task, { icon = '📌', note = '' } = {}) {
   const planned = rems.map((r) => humanOffset(r.label)).filter((l) => l !== 'просрочено');
 
   const overdue =
-    new Date(task.due_at) < new Date()
+    task.due_at && new Date(task.due_at) < new Date()
       ? '\n\n⚠️ Указанное время уже прошло — напоминаний не будет.'
       : '';
 
+  // У дела без срока нет ни даты, ни дедлайна — оно просто висит
+  const when = task.is_inbox || !task.due_at
+    ? '📥 без срока — напомню дважды в день'
+    : `🗓 ${fmt(new Date(task.due_at), TZ, task.is_all_day)}`;
+
   return (
     `${icon} <b>${esc(task.title)}</b>${task.is_private ? ' 🔒' : ''}\n` +
-    `🗓 ${fmt(new Date(task.due_at), TZ, task.is_all_day)}\n` +
+    `${when}\n` +
     (who.length ? `👤 ${esc(who[0].name)}\n` : '') +
-    `🔔 напомню: ${planned.length ? planned.join(', ') : 'нет (срок слишком близко)'}\n` +
+    (task.is_inbox || !task.due_at
+      ? ''
+      : `🔔 напомню: ${planned.length ? planned.join(', ') : 'нет (срок слишком близко)'}\n`) +
     `<code>#${task.id}</code>` +
     overdue +
     note
@@ -410,8 +453,8 @@ async function insertTask(ctx, parsed, { rawInput, creatorId }) {
     const { rows } = await c.query(
       `insert into tasks
          (title, due_at, is_all_day, tz, assignee_id, creator_id, chat_id, thread_id, offsets,
-          is_private, raw_input, nag_every_min, nag_from, nag_to)
-       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::int,$13::time,$14::time) returning *`,
+          is_private, raw_input, nag_every_min, nag_from, nag_to, is_inbox)
+       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::int,$13::time,$14::time,$15) returning *`,
       [
         parsed.title,
         parsed.dueAt,
@@ -427,6 +470,7 @@ async function insertTask(ctx, parsed, { rawInput, creatorId }) {
         parsed.nag?.everyMinutes || null,
         parsed.nag?.from || null,
         parsed.nag?.to || null,
+        !!parsed.isInbox,
       ]
     );
     await regenerateReminders(rows[0], c);
@@ -1391,6 +1435,7 @@ bot.callbackQuery(/^notmine:(\d+)$/, async (ctx) => {
  */
 const PRIVATE_COMMANDS = [
   { command: 'today', description: 'задачи на сегодня' },
+  { command: 'inbox', description: 'дела без срока' },
   { command: 'week', description: 'план на неделю' },
   { command: 'buy', description: 'список покупок' },
   { command: 'home', description: 'счётчики, коммуналка, тарифы' },

@@ -50,14 +50,17 @@ async function parseWithClaude(text, tz, now) {
 {"tasks": Task[], "question": string|null}
 
 Task:
-{"title": string, "due_at": string, "is_all_day": boolean, "offsets": string[],
+{"title": string, "due_at": string|null, "is_all_day": boolean, "offsets": string[],
  "assignee": string|null, "nag": {"every_minutes": number, "from": "HH:MM", "to": "HH:MM"}|null}
 
 - В одном сообщении может быть НЕСКОЛЬКО задач: нумерованный или маркированный
   список, либо прямая просьба «разбей на N отдельных» — верни их отдельными
   элементами tasks, у каждого свой title.
 - due_at — ISO 8601 со смещением, в таймзоне ${tz}
-- если время не указано — is_all_day=true, due_at на ${ALL_DAY_HOUR}:00 нужного дня
+- ЕСЛИ СРОКА НЕТ ВООБЩЕ — due_at: null. Это дела «когда-нибудь»: купить стеллаж,
+  заказать полку, разобрать балкон. НЕ выдумывай им дату: задача будет просто
+  висеть и напоминать о себе, пока её не закроют.
+- если назван день, но не время — is_all_day=true, due_at на ${ALL_DAY_HOUR}:00 этого дня
 - offsets — интервалы ДО срока, вида ["24h","3h","30m"]; если не просили — []
 - если названо только КОЛИЧЕСТВО напоминаний ("напоминай 2 раза"): 1 → ["30m"], 2 → ["24h","30m"], 3 → ["24h","3h","30m"]
 - nag — для формулировок «напоминать раз в N часов», «висеть весь день, пока не
@@ -123,12 +126,11 @@ question — задай его, если формулировка допуска
   const tasks = list
     .filter((t) => t && t.title)
     .map((t) => {
-      const due = t.due_at
-        ? DateTime.fromISO(t.due_at, { zone: tz })
-        : now.plus({ days: 1 }).set({ hour: ALL_DAY_HOUR, minute: 0, second: 0, millisecond: 0 });
+      const due = t.due_at ? DateTime.fromISO(t.due_at, { zone: tz }) : null;
       return {
         title: String(t.title).trim(),
-        dueAt: due.toJSDate(),
+        dueAt: due ? due.toJSDate() : null,
+        isInbox: !due,
         isAllDay: !!t.is_all_day,
         offsets: Array.isArray(t.offsets) ? t.offsets : [],
         assigneeUsername: t.assignee || null,
@@ -346,6 +348,10 @@ export function parseFallback(input, tz = TZ, now = DateTime.now().setZone(tz)) 
 
   const isAllDay = hour === null;
   let isAllDayResolved = isAllDay;
+  // Ни даты, ни времени — дело без срока, а не «завтра в 9 утра».
+  // Но если попросили напомнить «за сутки», дедлайн подразумевается:
+  // смещения без срока бессмысленны, поэтому такое остаётся обычной задачей.
+  const noSchedule = !date && hour === null && !absoluteTimes.length && !offsets.length;
 
   if (!date) {
     date = now;
@@ -398,7 +404,8 @@ export function parseFallback(input, tz = TZ, now = DateTime.now().setZone(tz)) 
 
   return {
     title: title || input.trim(),
-    dueAt: dueAt.toJSDate(),
+    dueAt: noSchedule ? null : dueAt.toJSDate(),
+    isInbox: noSchedule,
     isAllDay: isAllDayResolved,
     offsets,
     assigneeUsername,

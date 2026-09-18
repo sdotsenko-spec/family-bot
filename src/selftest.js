@@ -18,7 +18,7 @@ const cases = [
   '5 августа годовщина, напомни за неделю',
   'через 2 часа снять бельё',
   '12.08 в 9:00 техосмотр',
-  'купить корм коту',
+  'купить корм коту', // без даты и без напоминаний → дело без срока
   'в 7:00 разбудить всех',
   'послезавтра оплатить интернет @serhii',
 ];
@@ -34,11 +34,14 @@ const check2 = (name, got, want) => {
 for (const text of cases) {
   const r = parseFallback(text, TZ, NOW);
   const due = DateTime.fromJSDate(r.dueAt).setZone(TZ);
-  const ok = due.isValid && due >= NOW.minus({ minutes: 1 }) && r.title.length > 0;
+  // Дело без срока — валидный исход: dueAt = null
+  const ok = r.dueAt === null
+    ? r.isInbox === true && r.title.length > 0
+    : due.isValid && due >= NOW.minus({ minutes: 1 }) && r.title.length > 0;
   if (!ok) failures++;
   console.log(
-    `${ok ? '✓' : '✗'} ${text}\n    → «${r.title}» @ ${due.toFormat('ccc dd.MM HH:mm')}` +
-      `${r.isAllDay ? ' (весь день)' : ''}` +
+    `${ok ? '✓' : '✗'} ${text}\n    → «${r.title}» @ ${r.dueAt === null ? 'без срока (инбокс)' : due.toFormat('ccc dd.MM HH:mm')}` +
+      `${r.dueAt !== null && r.isAllDay ? ' (весь день)' : ''}` +
       `${r.offsets.length ? ' | ' + r.offsets.map(humanOffset).join(', ') : ''}` +
       `${r.assigneeUsername ? ' | @' + r.assigneeUsername : ''}`
   );
@@ -316,6 +319,19 @@ for (const [label, expected] of [
   check2('фолбэк — ровно одна задача', r.tasks.length, 1);
   check2('заголовок разобран', r.tasks[0].title, 'забрать посылку');
   check2('минимальный период долбёжки — час', MIN_NAG_MINUTES, 60);
+}
+
+// --- дела без срока ---------------------------------------------------------
+{
+  const inbox = parseFallback('купить стеллаж', TZ, NOW);
+  check2('дело без даты попадает в инбокс', [inbox.isInbox, inbox.dueAt], [true, null]);
+
+  const dated = parseFallback('завтра в 18:30 забрать посылку', TZ, NOW);
+  check2('дело с датой в инбокс не попадает', dated.isInbox, false);
+
+  // Смещения подразумевают дедлайн — такое остаётся обычной задачей
+  const withOffsets = parseFallback('купить хлеб, напомни за сутки', TZ, NOW);
+  check2('смещения без даты → не инбокс', withOffsets.isInbox, false);
 }
 
 console.log(failures ? `\n${failures} провалов` : '\nВсё зелёное');

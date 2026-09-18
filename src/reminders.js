@@ -29,6 +29,15 @@ const GROUP_PING = (process.env.GROUP_PING || 'all').toLowerCase();
 const MAX_PER_DAY = Number(process.env.MAX_REMINDERS_PER_DAY || 20);
 const MIN_GAP_MIN = Number(process.env.MIN_REMINDER_GAP_MIN || 60);
 
+// Во сколько напоминать о делах без срока. Дважды за день, в рабочем окне.
+const INBOX_TIMES = (process.env.INBOX_TIMES || '10:00,17:00')
+  .split(',')
+  .map((t) => t.trim())
+  .filter(Boolean);
+
+// На сколько дней вперёд заранее ставим напоминания инбокса
+const INBOX_HORIZON_DAYS = Number(process.env.INBOX_HORIZON_DAYS || 3);
+
 /**
  * Пересобирает напоминания задачи.
  * Уже отправленные (sent) не трогаем — только pending/sending.
@@ -50,6 +59,28 @@ export async function regenerateReminders(taskOrId, client = null) {
   );
 
   if (task.status !== 'pending') return 0;
+
+  // Задача без срока: ни дедлайна, ни просрочки, ни эскалации.
+  // Просто напоминает о себе дважды в день, пока её не закроют.
+  if (task.is_inbox || !task.due_at) {
+    const now = DateTime.now().setZone(task.tz || TZ);
+    let made = 0;
+    for (let d = 0; d < INBOX_HORIZON_DAYS; d++) {
+      const day = now.plus({ days: d });
+      for (const [i, slot] of INBOX_TIMES.entries()) {
+        const [h, m] = slot.split(':').map(Number);
+        const at = day.set({ hour: h, minute: m, second: 0, millisecond: 0 });
+        if (at <= now) continue;
+        await runner(
+          `insert into reminders(task_id, label, fire_at) values ($1,$2,$3)
+           on conflict (task_id, label) do update set fire_at = excluded.fire_at, status='pending'`,
+          [task.id, `inbox-${at.toFormat('yyyyLLdd')}-${i}`, at.toJSDate()]
+        );
+        made++;
+      }
+    }
+    return made;
+  }
 
   const due = new Date(task.due_at).getTime();
   const now = Date.now();
@@ -163,7 +194,7 @@ function escapeHtml(s) {
 }
 
 function renderText(reminder, task, assignee) {
-  const when = fmt(new Date(task.due_at), task.tz || TZ, task.is_all_day);
+  const when = task.due_at ? fmt(new Date(task.due_at), task.tz || TZ, task.is_all_day) : null;
   const who = assignee ? ` — ${mention(assignee)}` : '';
   const head =
     reminder.label === 'escalation'
@@ -175,7 +206,8 @@ function renderText(reminder, task, assignee) {
   const src = task.source !== 'bot' ? `\n<i>из календаря</i>` : '';
   const notes = task.notes ? `\n${escapeHtml(task.notes)}` : '';
 
-  return `${head}\n\n<b>${escapeHtml(task.title)}</b>${who}\n🗓 ${when}${notes}${src}`;
+  const dateLine = when ? `\n🗓 ${when}` : '';
+  return `${head}\n\n<b>${escapeHtml(task.title)}</b>${who}${dateLine}${notes}${src}`;
 }
 
 /**
@@ -293,7 +325,7 @@ export async function dispatchDueReminders(bot) {
         [task.chat_id]
       );
       const { today, last_at } = stat[0] || { today: 0, last_at: null };
-      const isNag = /^nag\d+$/.test(reminder.label);
+      const isNag = /^nag\d+$/.test(reminder.label) || /^inbox-/.test(reminder.label);
 
       if (isNag && today >= MAX_PER_DAY) {
         await q(`update reminders set status='skipped' where id = $1`, [reminder.id]);
@@ -404,4 +436,18 @@ export async function rescheduleTask(taskId, newDue) {
     await regenerateReminders(rows[0], c);
     return rows[0];
   });
+}
+
+/**
+ * Достраивает напоминания для дел без срока: они живут без дедлайна,
+ * поэтому горизонт надо продлевать, пока задача открыта.
+ */
+export async function topUpInboxReminders() {
+  const { rows } = await q(
+    `select * from tasks where status = 'pending' and is_inbox = true`
+  );
+  let n = 0;
+  for (const task of rows) n += await regenerateReminders(task);
+  if (n) console.log(`[inbox] напоминаний достроено: ${n}`);
+  return n;
 }
