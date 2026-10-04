@@ -419,7 +419,9 @@ async function renderTaskCard(task, { icon = '📌', note = '' } = {}) {
     [task.id]
   );
 
-  const planned = rems.map((r) => humanOffset(r.label)).filter((l) => l !== 'просрочено');
+  const planned = [
+    ...new Set(rems.map((r) => humanOffset(r.label)).filter((l) => l !== 'просрочено')),
+  ];
 
   const overdue =
     task.due_at && new Date(task.due_at) < new Date()
@@ -455,8 +457,8 @@ async function insertTask(ctx, parsed, { rawInput, creatorId }) {
     const { rows } = await c.query(
       `insert into tasks
          (title, due_at, is_all_day, tz, assignee_id, creator_id, chat_id, thread_id, offsets,
-          is_private, raw_input, nag_every_min, nag_from, nag_to, is_inbox)
-       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::int,$13::time,$14::time,$15) returning *`,
+          is_private, raw_input, nag_every_min, nag_from, nag_to, is_inbox, offsets_explicit)
+       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::int,$13::time,$14::time,$15,$16) returning *`,
       [
         parsed.title,
         parsed.dueAt,
@@ -473,6 +475,7 @@ async function insertTask(ctx, parsed, { rawInput, creatorId }) {
         parsed.nag?.from || null,
         parsed.nag?.to || null,
         !!parsed.isInbox,
+        !!parsed.offsets?.length, // просил ли конкретные напоминания сам
       ]
     );
     await regenerateReminders(rows[0], c);

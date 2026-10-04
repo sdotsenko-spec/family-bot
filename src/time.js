@@ -51,6 +51,8 @@ export function humanOffset(label) {
     escalation: 'просрочено',
   };
   if (map[label]) return map[label];
+  if (/^day[-\d]/.test(String(label))) return 'в течение дня';
+  if (/^inbox-/.test(String(label))) return 'дважды в день';
   const ms = offsetToMs(label);
   if (!ms) return label;
 

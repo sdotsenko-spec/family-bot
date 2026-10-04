@@ -60,30 +60,59 @@ export async function regenerateReminders(taskOrId, client = null) {
 
   if (task.status !== 'pending') return 0;
 
+  const zone = task.tz || TZ;
+  const now = DateTime.now().setZone(zone);
+
+  /** Ставит напоминания в слоты INBOX_TIMES указанного дня. */
+  const slotsFor = async (day, prefix) => {
+    let made = 0;
+    for (const [i, slot] of INBOX_TIMES.entries()) {
+      const [h, m] = slot.split(':').map(Number);
+      const at = day.set({ hour: h, minute: m, second: 0, millisecond: 0 });
+      if (at <= now) continue;
+      await runner(
+        `insert into reminders(task_id, label, fire_at) values ($1,$2,$3)
+         on conflict (task_id, label) do update set fire_at = excluded.fire_at, status='pending'`,
+        [task.id, `${prefix}-${at.toFormat('yyyyLLdd')}-${i}`, at.toJSDate()]
+      );
+      made++;
+    }
+    return made;
+  };
+
   // Задача без срока: ни дедлайна, ни просрочки, ни эскалации.
   // Просто напоминает о себе дважды в день, пока её не закроют.
   if (task.is_inbox || !task.due_at) {
-    const now = DateTime.now().setZone(task.tz || TZ);
     let made = 0;
     for (let d = 0; d < INBOX_HORIZON_DAYS; d++) {
-      const day = now.plus({ days: d });
-      for (const [i, slot] of INBOX_TIMES.entries()) {
-        const [h, m] = slot.split(':').map(Number);
-        const at = day.set({ hour: h, minute: m, second: 0, millisecond: 0 });
-        if (at <= now) continue;
-        await runner(
-          `insert into reminders(task_id, label, fire_at) values ($1,$2,$3)
-           on conflict (task_id, label) do update set fire_at = excluded.fire_at, status='pending'`,
-          [task.id, `inbox-${at.toFormat('yyyyLLdd')}-${i}`, at.toJSDate()]
-        );
-        made++;
-      }
+      made += await slotsFor(now.plus({ days: d }), 'inbox');
+    }
+    return made;
+  }
+
+  // Назван день, но не время, и конкретных напоминаний не просили.
+  // Отсчитывать «за 3 часа» от выдуманных 9:00 бессмысленно — это дало бы
+  // напоминание в 6 утра. Напоминаем пару раз в течение самого дня.
+  if (task.is_all_day && !task.offsets_explicit) {
+    const day = DateTime.fromJSDate(new Date(task.due_at)).setZone(zone);
+    let made = await slotsFor(day, 'day');
+
+    // Задачу завели вечером, слоты дня уже прошли — напомним ближайшим часом,
+    // иначе она промолчит весь срок
+    if (!made && day.hasSame(now, 'day') && now.hour < 22) {
+      const at = now.plus({ minutes: 30 });
+      await runner(
+        `insert into reminders(task_id, label, fire_at) values ($1,$2,$3)
+         on conflict (task_id, label) do update set fire_at = excluded.fire_at, status='pending'`,
+        [task.id, 'day-soon', at.toJSDate()]
+      );
+      made = 1;
     }
     return made;
   }
 
   const due = new Date(task.due_at).getTime();
-  const now = Date.now();
+  const nowMs = now.toMillis(); // now выше — DateTime, здесь нужны миллисекунды
   const labels = Array.isArray(task.offsets) ? task.offsets : DEFAULT_OFFSETS;
 
   const rows = [];
@@ -91,12 +120,12 @@ export async function regenerateReminders(taskOrId, client = null) {
     const ms = offsetToMs(label);
     if (ms == null) continue;
     const fireAt = due - ms;
-    if (fireAt <= now) continue;
+    if (fireAt <= nowMs) continue;
     rows.push([task.id, label, new Date(fireAt)]);
   }
 
   // Само наступление срока — тоже напоминание.
-  if (due > now) rows.push([task.id, 'due', new Date(due)]);
+  if (due > nowMs) rows.push([task.id, 'due', new Date(due)]);
 
   // Режим «висеть весь день, пока не отмечу»: повторы в окне суток.
   // Ограничиваем днём срока — бесконечная долбёжка никому не нужна.
@@ -111,13 +140,13 @@ export async function regenerateReminders(taskOrId, client = null) {
     let cursor = from.toMillis();
     let n = 0;
     while (cursor <= to.toMillis() && n < 24) {
-      if (cursor > now) rows.push([task.id, `nag${n}`, new Date(cursor)]);
+      if (cursor > nowMs) rows.push([task.id, `nag${n}`, new Date(cursor)]);
       cursor += every;
       n++;
     }
   }
 
-  if (ESCALATION_ENABLED && due + ESCALATE_AFTER_MS > now) {
+  if (ESCALATION_ENABLED && !task.is_all_day && due + ESCALATE_AFTER_MS > nowMs) {
     rows.push([task.id, 'escalation', new Date(due + ESCALATE_AFTER_MS)]);
   }
 
