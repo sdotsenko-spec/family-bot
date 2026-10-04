@@ -334,5 +334,17 @@ for (const [label, expected] of [
   check2('смещения без даты → не инбокс', withOffsets.isInbox, false);
 }
 
+// --- кнопки: у каждой должен быть обработчик ---------------------------------
+// Ловит ровно тот класс ошибок, когда кнопка есть, а callbackQuery для неё
+// не зарегистрирован: в Telegram это выглядит как вечная загрузка.
+{
+  const fs = await import('node:fs');
+  const src = fs.readFileSync(new URL('./bot.js', import.meta.url), 'utf8');
+  const used = [...src.matchAll(/\.text\([^,]+,\s*'([a-z_]+)'\)/g)].map((m) => m[1]);
+  const handled = [...src.matchAll(/callbackQuery\('([a-z_]+)'/g)].map((m) => m[1]);
+  const missing = [...new Set(used)].filter((u) => !handled.includes(u) && u !== 'noop');
+  check2('у всех кнопок есть обработчик', missing, []);
+}
+
 console.log(failures ? `\n${failures} провалов` : '\nВсё зелёное');
 process.exit(failures ? 1 : 0);

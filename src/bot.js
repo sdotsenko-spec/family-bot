@@ -1315,14 +1315,15 @@ bot.callbackQuery('home_meters', async (ctx) => {
 
 bot.callbackQuery('home_bill', async (ctx) => {
   await ctx.answerCallbackQuery();
-  if (sub === 'history') {
-    return ctx.reply(await renderHistory(), { parse_mode: 'HTML' });
-  }
-
   const bill = await computeBill();
   const text = await renderBill(bill);
   await rememberBill(bill); // запоминаем ПОСЛЕ рендера, иначе сравнит сам с собой
   return ctx.reply(text, { parse_mode: 'HTML', reply_markup: billKeyboard() });
+});
+
+bot.callbackQuery('home_history', async (ctx) => {
+  await ctx.answerCallbackQuery();
+  return ctx.reply(await renderHistory(), { parse_mode: 'HTML' });
 });
 
 bot.callbackQuery('home_tariffs', async (ctx) => {
