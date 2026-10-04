@@ -2,8 +2,13 @@
  * Оффлайн-проверка парсера и офсетов. БД и Telegram не нужны:
  *   node src/selftest.js
  */
-import { parseFallback } from './parser.js';
-import { offsetToMs, humanOffset, DateTime, TZ } from './time.js';
+// parser.js тянет learning.js → db.js, которому нужен DATABASE_URL.
+// Поэтому переменную выставляем ДО импортов, а сами импорты делаем
+// динамическими: статические поднимаются наверх и сработали бы раньше.
+process.env.DATABASE_URL ||= 'postgresql://localhost:5432/selftest';
+
+const { parseFallback } = await import('./parser.js');
+const { offsetToMs, humanOffset, DateTime, TZ } = await import('./time.js');
 
 const NOW = DateTime.fromISO('2026-07-26T14:00:00', { zone: TZ }); // воскресенье
 
@@ -13,7 +18,7 @@ const cases = [
   '5 августа годовщина, напомни за неделю',
   'через 2 часа снять бельё',
   '12.08 в 9:00 техосмотр',
-  'купить корм коту',
+  'купить корм коту', // без даты и без напоминаний → дело без срока
   'в 7:00 разбудить всех',
   'послезавтра оплатить интернет @serhii',
 ];
@@ -29,11 +34,14 @@ const check2 = (name, got, want) => {
 for (const text of cases) {
   const r = parseFallback(text, TZ, NOW);
   const due = DateTime.fromJSDate(r.dueAt).setZone(TZ);
-  const ok = due.isValid && due >= NOW.minus({ minutes: 1 }) && r.title.length > 0;
+  // Дело без срока — валидный исход: dueAt = null
+  const ok = r.dueAt === null
+    ? r.isInbox === true && r.title.length > 0
+    : due.isValid && due >= NOW.minus({ minutes: 1 }) && r.title.length > 0;
   if (!ok) failures++;
   console.log(
-    `${ok ? '✓' : '✗'} ${text}\n    → «${r.title}» @ ${due.toFormat('ccc dd.MM HH:mm')}` +
-      `${r.isAllDay ? ' (весь день)' : ''}` +
+    `${ok ? '✓' : '✗'} ${text}\n    → «${r.title}» @ ${r.dueAt === null ? 'без срока (инбокс)' : due.toFormat('ccc dd.MM HH:mm')}` +
+      `${r.dueAt !== null && r.isAllDay ? ' (весь день)' : ''}` +
       `${r.offsets.length ? ' | ' + r.offsets.map(humanOffset).join(', ') : ''}` +
       `${r.assigneeUsername ? ' | @' + r.assigneeUsername : ''}`
   );
@@ -75,7 +83,6 @@ for (const [label, expected] of [
 {
   // reminders.js тянет db.js, которому нужен DATABASE_URL. Пул создаётся,
   // но никуда не подключается — для чистой функции этого достаточно.
-  process.env.DATABASE_URL ||= 'postgresql://localhost:5432/selftest';
   const { chooseTargets } = await import('./reminders.js');
   const GROUP = -1001111111111;
   const DM = 555000111;
@@ -105,6 +112,14 @@ for (const [label, expected] of [
   check('исполнитель без лички — в чат задачи с подсказкой',
     chats(chooseTargets({ reminder: { label: '3h', task_id: 1 }, task: { ...base, dm_chat_id: null }, assignee: wife, familyChatId: GROUP })),
     [GROUP]);
+
+  check('личная задача — только в свою личку, без пинга и эскалации',
+    chats(chooseTargets({ reminder: { label: '3h', task_id: 1 }, task: { ...base, is_private: true, chat_id: DM }, assignee: wife, familyChatId: GROUP })),
+    [DM]);
+
+  check('личная задача: эскалация тоже не в группу',
+    chats(chooseTargets({ reminder: { label: 'escalation', task_id: 1 }, task: { ...base, is_private: true, chat_id: DM }, assignee: wife, familyChatId: GROUP })),
+    [DM]);
 
   check('эскалация — только в общий чат',
     chats(chooseTargets({ reminder: { label: 'escalation', task_id: 1 }, task: base, assignee: wife, familyChatId: GROUP })),
@@ -241,6 +256,82 @@ for (const [label, expected] of [
   check2('в типовом наборе есть день/ночь/общий',
     PRESET.filter(([n]) => n.startsWith('Электричество/')).map(([n]) => n.split('/')[1]),
     ['День', 'Ночь', 'Общий']);
+}
+
+// --- коммуналка: сверка модели с реальными платёжками ----------------------
+{
+  const { SETUP } = await import('./billing.js');
+
+  // Актуальная цена позиции на дату — та же логика, что в chargesAt
+  const rateAt = (provider, name, onDate) => {
+    const rows = SETUP.filter(
+      (c) => c.provider === provider && c.name === name && (c.validFrom || '2026-04-01') <= onDate
+    );
+    return rows.length ? rows[rows.length - 1].rate : null;
+  };
+
+  const compute = ({ onDate, hv, gv, te, day, night }) => {
+    const r = (p, n) => rateAt(p, n, onDate);
+    return (
+      r('Квартплата', 'Утримання буд.') +
+      r('Квартплата', 'Охорона') +
+      r('Квартплата', 'Відеоспостереження') +
+      hv * r('Киевводоканал', 'Постачання ХВ') +
+      r('Киевводоканал', 'Абонентське обсл.') +
+      gv * r('Киевводоканал', 'Водовідведення ГВ') +
+      gv * r('Гаряча вода', 'Постачання ГВ') +
+      r('Гаряча вода', 'Абонентське обсл.') +
+      te * r('Теплова енергія', 'ТЕ (ЦО) з ФСГ') +
+      r('Теплова енергія', 'Абонентське обсл.') +
+      day * r('Електроенергія', 'День') +
+      night * r('Електроенергія', 'Ніч')
+    );
+  };
+
+  // Апрель 2026: платёжка 8472 грн
+  const april = compute({ onDate: '2026-04-30', hv: 10.23, gv: 20.169, te: 34.41 / 1654.41, day: 718, night: 306 });
+  check2('апрель сходится с платёжкой (±2 грн)', Math.abs(april - 8472) < 2, true);
+
+  // Июль 2026: платёжка 5907 грн, абонплаты уже новые (с июня)
+  const july = compute({ onDate: '2026-07-31', hv: 11.5, gv: 12, te: 20.27 / 1654.41, day: 400, night: 166 });
+  check2('июль сходится с платёжкой (±2 грн)', Math.abs(july - 5907) < 2, true);
+
+  // Июнь: абонплата ГВ уже 30.6, а не 29.3
+  check2('абонплата ГВ до июня', rateAt('Гаряча вода', 'Абонентське обсл.', '2026-05-31'), 29.3);
+  check2('абонплата ГВ с июня', rateAt('Гаряча вода', 'Абонентське обсл.', '2026-06-15'), 30.6);
+  check2('абонплата ТЕ с июня', rateAt('Теплова енергія', 'Абонентське обсл.', '2026-07-01'), 43.39);
+
+  // Электричество считаем отдельно — там цифры в платёжках точные до копейки
+  check2('электричество апрель', Number((718 * 4.32 + 306 * 2.16).toFixed(2)), 3762.72);
+  check2('электричество июль', Number((400 * 4.32 + 166 * 2.16).toFixed(2)), 2086.56);
+}
+
+// --- контракт разбора: несколько задач, долбёжка, вопрос -------------------
+{
+  const { parseTask, MIN_NAG_MINUTES } = await import('./parser.js');
+
+  // Без ключа работает фолбэк — он всегда отдаёт ровно одну задачу,
+  // но в том же формате, что и модель
+  delete process.env.ANTHROPIC_API_KEY;
+  const r = await parseTask('завтра в 18:30 забрать посылку');
+  check2('фолбэк отдаёт массив задач', Array.isArray(r.tasks), true);
+  check2('фолбэк не задаёт вопросов', r.question, null);
+  check2('фолбэк — ровно одна задача', r.tasks.length, 1);
+  check2('заголовок разобран', r.tasks[0].title, 'забрать посылку');
+  check2('минимальный период долбёжки — час', MIN_NAG_MINUTES, 60);
+}
+
+// --- дела без срока ---------------------------------------------------------
+{
+  const inbox = parseFallback('купить стеллаж', TZ, NOW);
+  check2('дело без даты попадает в инбокс', [inbox.isInbox, inbox.dueAt], [true, null]);
+
+  const dated = parseFallback('завтра в 18:30 забрать посылку', TZ, NOW);
+  check2('дело с датой в инбокс не попадает', dated.isInbox, false);
+
+  // Смещения подразумевают дедлайн — такое остаётся обычной задачей
+  const withOffsets = parseFallback('купить хлеб, напомни за сутки', TZ, NOW);
+  check2('смещения без даты → не инбокс', withOffsets.isInbox, false);
 }
 
 console.log(failures ? `\n${failures} провалов` : '\nВсё зелёное');

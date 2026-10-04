@@ -120,6 +120,64 @@ export async function computeBill() {
   };
 }
 
+/**
+ * Запоминает посчитанный счёт. Вызывается при каждом расчёте, а не по команде:
+ * иначе история не накопится никогда — вручную сохранять никто не будет.
+ * Период определяется датой последнего снятия, поэтому повторный расчёт
+ * за тот же период обновляет строку, а не плодит дубли.
+ */
+export async function rememberBill(bill) {
+  if (bill.empty || !bill.periodEnd) return null;
+  // Недосчитанный счёт не запоминаем — в истории он был бы занижен
+  if (bill.missing?.length) return null;
+
+  const { rows } = await q(
+    `select id from bills
+      where (period_end at time zone 'UTC')::date = ($1::timestamptz at time zone 'UTC')::date`,
+    [bill.periodEnd]
+  );
+
+  if (rows.length) {
+    await q(`update bills set total = $2, breakdown = $3, period_start = $4 where id = $1`, [
+      rows[0].id,
+      bill.total.toFixed(2),
+      JSON.stringify(bill.providers),
+      bill.periodStart,
+    ]);
+    return rows[0];
+  }
+  return saveBill(bill);
+}
+
+/** История счетов по месяцам — сколько выходило и как менялось. */
+export async function renderHistory(limit = 12) {
+  const { rows } = await q(
+    `select * from bills order by period_end desc limit $1`,
+    [limit]
+  );
+  if (!rows.length) {
+    return 'История пуста. Посчитайте коммуналку — счёт запомнится автоматически.';
+  }
+
+  const lines = rows.map((b, i) => {
+    const end = DateTime.fromJSDate(b.period_end).setZone(TZ);
+    const month = end.setLocale('ru').toFormat('LLLL yyyy');
+    const next = rows[i + 1];
+    let diff = '';
+    if (next) {
+      const d = Number(b.total) - Number(next.total);
+      diff = ` <i>(${d >= 0 ? '+' : '−'}${money(Math.abs(d))})</i>`;
+    }
+    return `<b>${month}</b>: ${money(b.total)} грн${diff}`;
+  });
+
+  // Среднее считаем по всем, что есть — видно, выбивается ли текущий месяц
+  const avg = rows.reduce((sum, b) => sum + Number(b.total), 0) / rows.length;
+  lines.push('', `<i>В среднем: ${money(avg)} грн за ${rows.length} мес.</i>`);
+
+  return '📊 <b>История коммуналки</b>\n\n' + lines.join('\n');
+}
+
 export async function saveBill(bill) {
   if (bill.empty || !bill.periodEnd) return null;
   const { rows } = await q(
@@ -150,9 +208,19 @@ export async function renderBill(bill) {
     return 'Нужны показания минимум за два раза — иначе расход считать не с чем.';
   }
 
-  const from = DateTime.fromJSDate(bill.periodStart).setZone(TZ).toFormat('dd.MM');
-  const to = DateTime.fromJSDate(bill.periodEnd).setZone(TZ).toFormat('dd.MM');
-  const lines = [`🧾 <b>Коммуналка за ${from} — ${to}</b>`, ''];
+  const start = DateTime.fromJSDate(bill.periodStart).setZone(TZ);
+  const end = DateTime.fromJSDate(bill.periodEnd).setZone(TZ);
+
+  // Месяц берём по дате последнего снятия — так же, как называют месяц
+  // в платёжках: период 29.08–29.09 это счёт «за сентябрь».
+  const month = end.setLocale('ru').toFormat('LLLL');
+  const year = end.year === DateTime.now().year ? '' : ` ${end.year}`;
+
+  const lines = [
+    `🧾 <b>Коммуналка за ${month}${year}</b>`,
+    `<i>${start.toFormat('dd.MM')} — ${end.toFormat('dd.MM')}</i>`,
+    '',
+  ];
 
   for (const group of bill.providers) {
     lines.push(`<b>${esc(group.provider)}</b> — ${money(group.sum)} грн`);
@@ -171,9 +239,10 @@ export async function renderBill(bill) {
   const prev = await previousBill(bill.periodEnd);
   if (prev) {
     const diff = bill.total - Number(prev.total);
-    const when = DateTime.fromJSDate(prev.period_end).setZone(TZ).toFormat('dd.MM');
+    const prevEnd = DateTime.fromJSDate(prev.period_end).setZone(TZ);
+    const prevMonth = prevEnd.setLocale('ru').toFormat('LLLL');
     lines.push(
-      `<i>Прошлый период (до ${when}): ${money(prev.total)} — ` +
+      `<i>${prevMonth}: ${money(prev.total)} — ` +
         `${diff >= 0 ? '+' : '−'}${money(Math.abs(diff))}</i>`
     );
   }

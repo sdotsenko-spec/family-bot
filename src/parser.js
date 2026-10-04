@@ -1,4 +1,5 @@
 import { DateTime, TZ, ALL_DAY_HOUR } from './time.js';
+import { examplesBlock } from './learning.js';
 
 /**
  * Разбирает фразу вида «завтра в 18:30 забрать посылку, напомни за день и за 2 часа»
@@ -7,6 +8,15 @@ import { DateTime, TZ, ALL_DAY_HOUR } from './time.js';
  * Сначала пробуем Claude (если задан ANTHROPIC_API_KEY) — он вывозит кривые
  * формулировки. Если ключа нет или API упал — работает регексповый фолбэк,
  * его достаточно для 90% бытовых фраз.
+ */
+// Чаще раза в час не долбим ничем и никогда — иначе бота выключат
+export const MIN_NAG_MINUTES = 60;
+
+/**
+ * Возвращает { tasks: [...], question: string|null }.
+ * Задач может быть несколько: «разбей на 4 отдельных» — рабочая формулировка.
+ * question заполняется, когда модель не уверена и лучше переспросить,
+ * чем угадать: молчаливая догадка обходится дороже лишнего вопроса.
  */
 export async function parseTask(text, { tz = TZ, now = DateTime.now().setZone(TZ) } = {}) {
   if (process.env.ANTHROPIC_API_KEY) {
@@ -17,7 +27,8 @@ export async function parseTask(text, { tz = TZ, now = DateTime.now().setZone(TZ
       console.warn('[parser] Claude недоступен, фолбэк:', e.message);
     }
   }
-  return parseFallback(text, tz, now);
+  // Регулярки нескольких задач не умеют — отдают одну, но в том же формате
+  return { tasks: [parseFallback(text, tz, now)], question: null };
 }
 
 // --- LLM --------------------------------------------------------------------
@@ -25,17 +36,46 @@ export async function parseTask(text, { tz = TZ, now = DateTime.now().setZone(TZ
 const MODEL = process.env.ANTHROPIC_MODEL || 'claude-haiku-4-5-20251001';
 
 async function parseWithClaude(text, tz, now) {
+  // Примеры из исправлений: чем дольше живёт бот, тем точнее разбор
+  let learned = '';
+  try {
+    learned = await examplesBlock();
+  } catch (e) {
+    console.warn('[parser] примеры недоступны:', e.message);
+  }
+
   const system = `Ты парсер бытовых задач. Отвечай ТОЛЬКО валидным JSON, без markdown и пояснений.
-Схема:
-{"title": string, "due_at": string|null, "is_all_day": boolean, "offsets": string[], "assignee": string|null}
+
+Схема ответа:
+{"tasks": Task[], "question": string|null}
+
+Task:
+{"title": string, "due_at": string|null, "is_all_day": boolean, "offsets": string[],
+ "assignee": string|null, "nag": {"every_minutes": number, "from": "HH:MM", "to": "HH:MM"}|null}
+
+- В одном сообщении может быть НЕСКОЛЬКО задач: нумерованный или маркированный
+  список, либо прямая просьба «разбей на N отдельных» — верни их отдельными
+  элементами tasks, у каждого свой title.
 - due_at — ISO 8601 со смещением, в таймзоне ${tz}
-- если время не указано — is_all_day=true, due_at на ${ALL_DAY_HOUR}:00 нужного дня
-- offsets — массив вида ["24h","3h","30m"]; если пользователь не просил — верни []
-- если названо только КОЛИЧЕСТВО напоминаний ("напоминай 2 раза"), верни столько интервалов: 1 → ["30m"], 2 → ["24h","30m"], 3 → ["24h","3h","30m"]
-- любое явно указанное время суток ("в 18:00", "именно в 18:00") ВСЕГДА попадает в due_at, is_all_day при этом false — даже если время названо в конце фразы или повторно
+- ЕСЛИ СРОКА НЕТ ВООБЩЕ — due_at: null. Это дела «когда-нибудь»: купить стеллаж,
+  заказать полку, разобрать балкон. НЕ выдумывай им дату: задача будет просто
+  висеть и напоминать о себе, пока её не закроют.
+- если назван день, но не время — is_all_day=true, due_at на ${ALL_DAY_HOUR}:00 этого дня
+- offsets — интервалы ДО срока, вида ["24h","3h","30m"]; если не просили — []
+- если названо только КОЛИЧЕСТВО напоминаний ("напоминай 2 раза"): 1 → ["30m"], 2 → ["24h","30m"], 3 → ["24h","3h","30m"]
+- nag — для формулировок «напоминать раз в N часов», «висеть весь день, пока не
+  отмечу», «долби с 11 до 19». every_minutes — период, from/to — окно суток.
+  Если окно не названо, бери 09:00–21:00. Во всех прочих случаях nag=null.
+- любое явно указанное время суток ВСЕГДА попадает в due_at, is_all_day=false
 - assignee — telegram-username без @, если задача явно на кого-то; иначе null
 - title — короткий, без даты/времени/слов про напоминания
-Сейчас: ${now.toISO()} (${tz}).`;
+
+question — задай его, если формулировка допускает разные прочтения и ошибка
+дорого обойдётся: непонятно, одна это задача или несколько; не ясен день;
+непонятно, на кого. Если спрашиваешь — верни tasks: [] и текст вопроса.
+Не переспрашивай в очевидных случаях.
+
+Сейчас: ${now.toISO()} (${tz}).${learned}`;
 
   const res = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
@@ -46,7 +86,9 @@ async function parseWithClaude(text, tz, now) {
     },
     body: JSON.stringify({
       model: MODEL,
-      max_tokens: 400,
+      // Хватает на список задач: одна задача ~100 токенов, а «разбей на 4»
+      // в старые 400 не влезало — JSON обрывался и всё падало в фолбэк
+      max_tokens: 2000,
       system,
       messages: [{ role: 'user', content: text }],
     }),
@@ -54,6 +96,12 @@ async function parseWithClaude(text, tz, now) {
 
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const data = await res.json();
+
+  // Обрыв по лимиту даёт невалидный JSON, и без этой проверки причина
+  // выглядела бы как «модель вернула чушь»
+  if (data.stop_reason === 'max_tokens') {
+    throw new Error('ответ обрезан по max_tokens');
+  }
   const raw = (data.content || [])
     .filter((b) => b.type === 'text')
     .map((b) => b.text)
@@ -61,20 +109,44 @@ async function parseWithClaude(text, tz, now) {
     .replace(/```json|```/g, '')
     .trim();
 
-  const parsed = JSON.parse(raw);
-  if (!parsed.title) return null;
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error(`невалидный JSON: ${raw.slice(0, 120)}`);
+  }
 
-  const due = parsed.due_at
-    ? DateTime.fromISO(parsed.due_at, { zone: tz })
-    : now.plus({ days: 1 }).set({ hour: ALL_DAY_HOUR, minute: 0, second: 0, millisecond: 0 });
+  if (parsed.question && (!parsed.tasks || !parsed.tasks.length)) {
+    return { question: String(parsed.question).trim(), tasks: [] };
+  }
 
-  return {
-    title: parsed.title.trim(),
-    dueAt: due.toJSDate(),
-    isAllDay: !!parsed.is_all_day,
-    offsets: Array.isArray(parsed.offsets) ? parsed.offsets : [],
-    assigneeUsername: parsed.assignee || null,
-  };
+  const list = Array.isArray(parsed.tasks) ? parsed.tasks : parsed.title ? [parsed] : [];
+  if (!list.length) return null;
+
+  const tasks = list
+    .filter((t) => t && t.title)
+    .map((t) => {
+      const due = t.due_at ? DateTime.fromISO(t.due_at, { zone: tz }) : null;
+      return {
+        title: String(t.title).trim(),
+        dueAt: due ? due.toJSDate() : null,
+        isInbox: !due,
+        isAllDay: !!t.is_all_day,
+        offsets: Array.isArray(t.offsets) ? t.offsets : [],
+        assigneeUsername: t.assignee || null,
+        nag: normalizeNag(t.nag),
+      };
+    });
+
+  return tasks.length ? { tasks, question: null } : null;
+}
+
+/** Приводим окно долбёжки к разумным рамкам — модель может вернуть что угодно. */
+function normalizeNag(nag) {
+  if (!nag || !Number.isFinite(Number(nag.every_minutes))) return null;
+  const every = Math.max(MIN_NAG_MINUTES, Math.round(Number(nag.every_minutes)));
+  const time = (v, fallback) => (/^\d{1,2}:\d{2}$/.test(String(v || '')) ? v : fallback);
+  return { everyMinutes: every, from: time(nag.from, '09:00'), to: time(nag.to, '21:00') };
 }
 
 // --- Фолбэк без LLM ---------------------------------------------------------
@@ -276,6 +348,10 @@ export function parseFallback(input, tz = TZ, now = DateTime.now().setZone(tz)) 
 
   const isAllDay = hour === null;
   let isAllDayResolved = isAllDay;
+  // Ни даты, ни времени — дело без срока, а не «завтра в 9 утра».
+  // Но если попросили напомнить «за сутки», дедлайн подразумевается:
+  // смещения без срока бессмысленны, поэтому такое остаётся обычной задачей.
+  const noSchedule = !date && hour === null && !absoluteTimes.length && !offsets.length;
 
   if (!date) {
     date = now;
@@ -328,7 +404,8 @@ export function parseFallback(input, tz = TZ, now = DateTime.now().setZone(tz)) 
 
   return {
     title: title || input.trim(),
-    dueAt: dueAt.toJSDate(),
+    dueAt: noSchedule ? null : dueAt.toJSDate(),
+    isInbox: noSchedule,
     isAllDay: isAllDayResolved,
     offsets,
     assigneeUsername,

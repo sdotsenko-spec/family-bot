@@ -100,6 +100,7 @@ export async function buildFeed() {
       where t.status = 'pending'
         and t.source <> 'ics'
         and t.recurrence_id is null
+        and t.due_at is not null
         and t.due_at between $1 and $2
       order by t.due_at`,
     [from, to]
