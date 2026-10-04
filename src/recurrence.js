@@ -242,8 +242,8 @@ export async function materializeRecurrence(rec) {
       const { rows } = await c.query(
         `insert into tasks
            (title, notes, due_at, is_all_day, tz, assignee_id, creator_id, chat_id, thread_id,
-            offsets, source, external_id, occurrence_start, recurrence_id, is_private)
-         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'recur',$11,$12,$13,$14)
+            offsets, source, external_id, occurrence_start, recurrence_id)
+         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'recur',$11,$12,$13)
          on conflict do nothing
          returning id`,
         [
@@ -260,7 +260,6 @@ export async function materializeRecurrence(rec) {
           String(rec.id),
           occurrenceStart,
           rec.id,
-          rec.is_private === true,
         ]
       );
       if (rows.length) {

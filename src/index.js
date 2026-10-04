@@ -1,11 +1,10 @@
 import 'dotenv/config';
 import http from 'node:http';
 import { migrate, pool } from './db.js';
-import { bot, maybeSendDigest, registerCommands } from './bot.js';
+import { bot, maybeSendDigest } from './bot.js';
 import { dispatchDueReminders } from './reminders.js';
 import { syncAllCalendars } from './calendar/ics.js';
 import { materializeAll } from './recurrence.js';
-import { topUpInboxReminders } from './reminders.js';
 import { buildFeed, feedToken } from './feed.js';
 
 const REMINDER_TICK_MS = 60_000;
@@ -43,7 +42,6 @@ async function main() {
 
   heartbeat('calendars', CAL_TICK_MS, syncAllCalendars);
   heartbeat('recurrences', 3_600_000, materializeAll); // раз в час достраиваем горизонт
-  heartbeat('inbox', 3_600_000, topUpInboxReminders); // и напоминания дел без срока
   heartbeat('digest', 60_000, maybeSendDigest);
 
   // Первый проход сразу после старта — добираем всё, что созрело за время деплоя
@@ -84,15 +82,7 @@ async function main() {
     .listen(port, () => console.log(`[http] health на :${port}`));
 
   bot.start({
-    onStart: async (me) => {
-      console.log(`[bot] запущен как @${me.username}`);
-      // Меню обновляем после старта: до него api-вызовы делать нечем
-      try {
-        await registerCommands();
-      } catch (e) {
-        console.warn('[bot] не удалось обновить меню команд:', e.message);
-      }
-    },
+    onStart: (me) => console.log(`[bot] запущен как @${me.username}`),
     drop_pending_updates: true,
   });
 }
